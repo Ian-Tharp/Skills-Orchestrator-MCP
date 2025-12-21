@@ -26,17 +26,28 @@ import time
 import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime, timezone
-from enum import Enum
 from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP, Context
-from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from .artifacts import ArtifactStore
 from .skill_index import SkillIndex
 from .usage_stats import UsageTracker
+from .models import (
+    CreateSkillInput,
+    ExecuteCodeInput,
+    GetArtifactInput,
+    InvokeSkillInput,
+    ListStateInput,
+    ResponseFormat,
+    ReturnMode,
+    SearchSkillsInput,
+    SkillCategory,
+    StateInput,
+    StoreArtifactInput,
+)
 
 # =============================================================================
 # Configuration
@@ -126,268 +137,6 @@ _last_index_refresh_check_monotonic = 0.0
 # =============================================================================
 
 mcp = FastMCP("skill_orchestrator_mcp")
-
-# =============================================================================
-# Pydantic Models for Input Validation
-# =============================================================================
-
-class SkillCategory(str, Enum):
-    """Categories for organizing skills."""
-    DATA_PROCESSING = "data_processing"
-    FILE_OPERATIONS = "file_operations"
-    API_INTEGRATION = "api_integration"
-    TEXT_ANALYSIS = "text_analysis"
-    AUTOMATION = "automation"
-    VISUALIZATION = "visualization"
-    COMPUTATION = "computation"
-    WORKFLOW = "workflow"
-    UTILITY = "utility"
-    CUSTOM = "custom"
-
-
-class ResponseFormat(str, Enum):
-    """Output format options."""
-    MARKDOWN = "markdown"
-    JSON = "json"
-
-
-class ReturnMode(str, Enum):
-    """How tools should return results to the agent."""
-
-    SUMMARY = "summary"  # short excerpt + artifact handle (default)
-    HANDLE = "handle"  # artifact handle only
-    FULL = "full"  # full text response (may be large; still stored as artifact)
-
-
-class CreateSkillInput(BaseModel):
-    """Input model for creating a new skill."""
-    model_config = ConfigDict(
-        str_strip_whitespace=True,
-        validate_assignment=True,
-        extra='forbid'
-    )
-    
-    name: str = Field(
-        ...,
-        description="Unique identifier for the skill (snake_case, e.g., 'process_csv_data')",
-        min_length=1,
-        max_length=100,
-        pattern=r'^[a-z][a-z0-9_]*$'
-    )
-    description: str = Field(
-        ...,
-        description="Clear description of what the skill does and when to use it",
-        min_length=10,
-        max_length=1000
-    )
-    code: str = Field(
-        ...,
-        description="Python code implementing the skill. Should define a main() function or be directly executable.",
-        min_length=10,
-        max_length=50000
-    )
-    category: SkillCategory = Field(
-        default=SkillCategory.CUSTOM,
-        description="Category for organizing and discovering the skill"
-    )
-    tags: List[str] = Field(
-        default_factory=list,
-        description="Tags for searchability (e.g., ['csv', 'pandas', 'analysis'])",
-        max_length=20
-    )
-    dependencies: List[str] = Field(
-        default_factory=list,
-        description="Python package dependencies (e.g., ['pandas', 'requests'])",
-        max_length=20
-    )
-    parameters_schema: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="JSON Schema for skill parameters (optional, for parameterized skills)"
-    )
-    examples: List[str] = Field(
-        default_factory=list,
-        description="Example usage strings to help discover when this skill is useful",
-        max_length=5
-    )
-
-
-class ExecuteCodeInput(BaseModel):
-    """Input model for code execution."""
-    model_config = ConfigDict(
-        str_strip_whitespace=True,
-        extra='forbid'
-    )
-    
-    code: str = Field(
-        ...,
-        description="Python code to execute",
-        min_length=1,
-        max_length=100000
-    )
-    context: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Variables to inject into the execution namespace"
-    )
-    timeout: int = Field(
-        default=MAX_EXECUTION_TIME,
-        description="Maximum execution time in seconds",
-        ge=1,
-        le=MAX_EXECUTION_TIME_LIMIT
-    )
-    capture_output: bool = Field(
-        default=True,
-        description="Whether to capture and return stdout/stderr"
-    )
-    return_mode: ReturnMode = Field(
-        default=ReturnMode.SUMMARY,
-        description="Return mode: 'summary' (default), 'handle', or 'full'"
-    )
-    artifact_ttl_seconds: Optional[int] = Field(
-        default=None,
-        description="Optional TTL for stored artifact outputs (seconds)",
-        ge=1,
-        le=7 * 24 * 60 * 60
-    )
-
-
-class InvokeSkillInput(BaseModel):
-    """Input model for invoking a stored skill."""
-    model_config = ConfigDict(
-        str_strip_whitespace=True,
-        extra='forbid'
-    )
-    
-    skill_name: str = Field(
-        ...,
-        description="Name of the skill to invoke",
-        min_length=1,
-        max_length=100
-    )
-    parameters: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Parameters to pass to the skill"
-    )
-    context: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Additional context variables"
-    )
-    timeout: int = Field(
-        default=MAX_EXECUTION_TIME,
-        description="Maximum execution time in seconds",
-        ge=1,
-        le=MAX_EXECUTION_TIME_LIMIT
-    )
-    return_mode: ReturnMode = Field(
-        default=ReturnMode.SUMMARY,
-        description="Return mode: 'summary' (default), 'handle', or 'full'"
-    )
-    artifact_ttl_seconds: Optional[int] = Field(
-        default=None,
-        description="Optional TTL for stored artifact outputs (seconds)",
-        ge=1,
-        le=7 * 24 * 60 * 60
-    )
-
-
-class SearchSkillsInput(BaseModel):
-    """Input model for searching skills."""
-    model_config = ConfigDict(
-        str_strip_whitespace=True,
-        extra='forbid'
-    )
-    
-    query: Optional[str] = Field(
-        default=None,
-        description="Text query to search skill names, descriptions, and tags"
-    )
-    category: Optional[SkillCategory] = Field(
-        default=None,
-        description="Filter by category"
-    )
-    tags: Optional[List[str]] = Field(
-        default=None,
-        description="Filter by tags (skills matching ANY of these tags)"
-    )
-    limit: int = Field(
-        default=20,
-        description="Maximum number of results to return",
-        ge=1,
-        le=200
-    )
-    cursor: int = Field(
-        default=0,
-        description="Pagination cursor (0-based offset into the sorted result set)",
-        ge=0
-    )
-    fields: Optional[List[str]] = Field(
-        default=None,
-        description="For JSON responses: optional list of fields to include per item (e.g. ['name','description','category'])"
-    )
-    include_code: bool = Field(
-        default=False,
-        description="Whether to include full code in results"
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' for human-readable, 'json' for structured"
-    )
-
-
-class StateInput(BaseModel):
-    """Input model for state operations."""
-    model_config = ConfigDict(
-        str_strip_whitespace=True,
-        extra='forbid'
-    )
-    
-    key: str = Field(
-        ...,
-        description="State key (dot notation supported, e.g., 'session.user_prefs')",
-        min_length=1,
-        max_length=200
-    )
-    value: Optional[Any] = Field(
-        default=None,
-        description="Value to store (JSON-serializable)"
-    )
-    namespace: str = Field(
-        default="default",
-        description="Namespace for organizing state",
-        min_length=1,
-        max_length=50
-    )
-
-
-class StoreArtifactInput(BaseModel):
-    """Input model for storing an artifact explicitly."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    content: str = Field(..., description="Artifact content (stored as UTF-8 text)", min_length=1)
-    mime_type: str = Field(
-        default="text/plain",
-        description="MIME type hint (e.g. text/plain, text/markdown, application/json)",
-        min_length=3,
-        max_length=100,
-    )
-    name: Optional[str] = Field(default=None, description="Optional human-friendly name")
-    ttl_seconds: Optional[int] = Field(
-        default=None,
-        description="Optional TTL in seconds",
-        ge=1,
-        le=7 * 24 * 60 * 60,
-    )
-
-
-class GetArtifactInput(BaseModel):
-    """Input model for retrieving an artifact chunk."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    artifact_id: str = Field(..., description="Artifact ID", min_length=1, max_length=64)
-    start: int = Field(default=0, description="Start offset (bytes)", ge=0)
-    limit: int = Field(default=10_000, description="Max bytes to return", ge=1, le=200_000)
-
 
 # =============================================================================
 # Helper Functions
@@ -1382,29 +1131,41 @@ async def get_state(key: str, namespace: str = "default") -> str:
 @mcp.tool(
     name="list_state",
     annotations={
-        "title": "List All State Keys",
+        "title": "List State Keys (Paginated)",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False
     }
 )
-async def list_state(namespace: str = "default", response_format: str = "markdown") -> str:
-    """List all keys in a state namespace.
-    
+async def list_state(params: ListStateInput) -> str:
+    """List keys in a state namespace with pagination and context-efficient response modes.
+
+    Supports three return modes:
+    - SUMMARY (default): Keys with type info and short value previews, paginated
+    - HANDLE: Returns artifact reference for full state data
+    - FULL: Complete paginated list with full values (use sparingly)
+
     Args:
-        namespace: State namespace to list
-        response_format: 'markdown' or 'json'
-    
+        params: ListStateInput containing:
+            - namespace: State namespace to list (default: "default")
+            - response_format: 'markdown' or 'json'
+            - limit: Maximum keys to return (default: 50, max: 500)
+            - cursor: Pagination offset (default: 0)
+            - return_mode: SUMMARY, HANDLE, or FULL
+            - include_values: Whether to include full values (FULL mode only)
+            - value_preview_length: Max chars for value previews (default: 50)
+
     Returns:
-        str: List of state keys and their types
+        str: Paginated list of state keys with metadata
     """
-    state = _load_state(namespace)
-    
+    state = _load_state(params.namespace)
+
     if not state:
-        return f"No state found in namespace '{namespace}'."
-    
+        return f"No state found in namespace '{params.namespace}'."
+
     def _flatten_keys(d: dict, prefix: str = "") -> List[tuple]:
+        """Flatten nested state into (key, type, value) tuples."""
         items = []
         for k, v in d.items():
             key = f"{prefix}.{k}" if prefix else k
@@ -1413,18 +1174,99 @@ async def list_state(namespace: str = "default", response_format: str = "markdow
             else:
                 items.append((key, type(v).__name__, v))
         return items
-    
+
     flat = _flatten_keys(state)
-    
-    if response_format == "json":
-        return json.dumps([{"key": k, "type": t, "value": v} for k, t, v in flat], indent=2, default=str)
-    
-    lines = [f"## State in namespace '{namespace}'\n"]
-    for key, type_name, value in flat:
-        val_preview = str(value)[:50] + "..." if len(str(value)) > 50 else str(value)
-        lines.append(f"- **{key}** ({type_name}): `{val_preview}`")
-    
-    return "\n".join(lines)
+    total = len(flat)
+
+    # Apply pagination
+    start = min(params.cursor, total)
+    end = min(start + params.limit, total)
+    page = flat[start:end]
+    next_cursor: Optional[int] = end if end < total else None
+
+    # Build full output (may be stored as artifact)
+    if params.response_format == ResponseFormat.JSON:
+        items = []
+        for key, type_name, value in page:
+            item = {"key": key, "type": type_name}
+            if params.return_mode == ReturnMode.FULL and params.include_values:
+                item["value"] = value
+            elif params.return_mode != ReturnMode.HANDLE:
+                # Summary mode: include preview
+                val_str = str(value)
+                if len(val_str) > params.value_preview_length:
+                    item["value_preview"] = val_str[:params.value_preview_length] + "..."
+                else:
+                    item["value_preview"] = val_str
+            items.append(item)
+
+        payload = {
+            "namespace": params.namespace,
+            "total_keys": total,
+            "cursor": params.cursor,
+            "next_cursor": next_cursor,
+            "items": items,
+        }
+        full_text = json.dumps(payload, indent=2, default=str)
+    else:
+        # Markdown format
+        lines = [
+            f"## State in namespace '{params.namespace}'",
+            f"Total keys: {total} | Showing: {len(page)} (cursor={params.cursor}, limit={params.limit})\n"
+        ]
+
+        for key, type_name, value in page:
+            if params.return_mode == ReturnMode.FULL and params.include_values:
+                # Full value (potentially large)
+                val_str = str(value)
+                if len(val_str) > 200:
+                    lines.append(f"### {key} ({type_name})")
+                    lines.append(f"```\n{val_str}\n```\n")
+                else:
+                    lines.append(f"- **{key}** ({type_name}): `{val_str}`")
+            elif params.return_mode != ReturnMode.HANDLE:
+                # Summary: short preview
+                val_str = str(value)
+                if len(val_str) > params.value_preview_length:
+                    val_preview = val_str[:params.value_preview_length] + "..."
+                else:
+                    val_preview = val_str
+                lines.append(f"- **{key}** ({type_name}): `{val_preview}`")
+            else:
+                # Handle mode: keys and types only
+                lines.append(f"- **{key}** ({type_name})")
+
+        if next_cursor is not None:
+            lines.append(f"\n**Next cursor:** {next_cursor} (use to fetch more keys)")
+
+        full_text = "\n".join(lines)
+
+    # Handle different return modes with artifact system
+    ref = ARTIFACT_STORE.put_text(
+        full_text,
+        mime_type="application/json" if params.response_format == ResponseFormat.JSON else "text/markdown",
+        name=f"list_state:{params.namespace}",
+        ttl_seconds=300,  # 5 min TTL for state listings
+    )
+
+    if params.return_mode == ReturnMode.HANDLE:
+        return json.dumps({"artifact_id": ref.artifact_id, "resource": ref.resource_uri}, indent=2)
+
+    if params.return_mode == ReturnMode.SUMMARY:
+        # Return summary + artifact reference
+        preview = full_text[:1000]
+        truncated = " (truncated)" if len(full_text) > 1000 else ""
+        return (
+            f"## State Listing (summary): {params.namespace}\n\n"
+            f"- **Artifact:** `{ref.resource_uri}`\n"
+            f"- **Artifact ID:** `{ref.artifact_id}`\n"
+            f"- **Total keys:** {total}\n"
+            f"- **Showing:** {len(page)} keys\n\n"
+            f"**Preview{truncated}:**\n```\n{preview}\n```"
+        )
+
+    # FULL mode: return complete output (also stored as artifact)
+    return f"{full_text}\n\n---\nFull output stored as `{ref.resource_uri}`"
 
 
 # =============================================================================

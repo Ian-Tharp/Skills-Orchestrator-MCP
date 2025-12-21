@@ -6,7 +6,13 @@
       "Bash(dir \"C:\\\\Users\\\\Owner\\\\.skill_orchestrator\\\\state\")",
       "mcp__skill-orchestrator__search_skills",
       "mcp__skill-orchestrator__execute_code",
-      "mcp__skill-orchestrator__get_artifact"
+      "mcp__skill-orchestrator__get_artifact",
+      "Bash(mkdir:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python:*)",
+      "mcp__skill-orchestrator__create_skill",
+      "mcp__skill-orchestrator__invoke_skill",
+      "mcp__skill-orchestrator__update_skill"
     ]
   }
 }
