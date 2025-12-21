@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__skill-orchestrator__get_orchestrator_status",
+      "mcp__skill-orchestrator__list_state",
+      "Bash(dir \"C:\\\\Users\\\\Owner\\\\.skill_orchestrator\\\\state\")",
+      "mcp__skill-orchestrator__search_skills",
+      "mcp__skill-orchestrator__execute_code",
+      "mcp__skill-orchestrator__get_artifact"
+    ]
+  }
+}
