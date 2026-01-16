@@ -12,7 +12,17 @@
       "Bash(python:*)",
       "mcp__skill-orchestrator__create_skill",
       "mcp__skill-orchestrator__invoke_skill",
-      "mcp__skill-orchestrator__update_skill"
+      "mcp__skill-orchestrator__update_skill",
+      "WebFetch(domain:substack.com)",
+      "WebFetch(domain:iantharp.substack.com)",
+      "mcp__mcp-obsidian__obsidian_get_file_contents",
+      "mcp__mcp-obsidian__obsidian_list_files_in_dir",
+      "mcp__mcp-obsidian__obsidian_append_content",
+      "mcp__mcp-obsidian__obsidian_list_files_in_vault",
+      "mcp__mcp-obsidian__obsidian_simple_search",
+      "mcp__skill-orchestrator__delete_skill",
+      "Bash(ls:*)",
+      "Bash(dir \"C:\\\\Users\\\\Owner\\\\Desktop\\\\Projects\\\\Claude MCP Orchestrator\\\\tests\")"
     ]
   }
 }

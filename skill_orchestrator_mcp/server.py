@@ -128,6 +128,9 @@ SUBPROCESS_TERMINATION_GRACE_SECONDS = max(
     _get_float_env("SKILL_ORCHESTRATOR_TERMINATION_GRACE_SECONDS", 5.0),
 )
 
+# Skill composition limits
+MAX_SKILL_CALL_DEPTH = _get_int_env("SKILL_ORCHESTRATOR_MAX_CALL_DEPTH", 10)
+
 # Index refresh debounce (to detect out-of-band skill file changes without rescanning constantly)
 _INDEX_REFRESH_CHECK_INTERVAL_SECONDS = 2.0
 _last_index_refresh_check_monotonic = 0.0
@@ -214,6 +217,25 @@ def _sanitize_code_output(output: str) -> str:
     if len(output) > MAX_OUTPUT_SIZE:
         return output[:MAX_OUTPUT_SIZE] + f"\n\n... [truncated, {len(output) - MAX_OUTPUT_SIZE} characters omitted]"
     return output
+
+
+def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
+    """Build a registry of all skills for subprocess injection.
+
+    Returns a dict mapping skill names to their full definitions (including code).
+    This enables skill composition - skills can invoke other skills during execution.
+    """
+    registry = {}
+    for name, meta in SKILL_INDEX.all().items():
+        skill = _load_skill(name)
+        if skill:
+            registry[name] = {
+                'name': skill['name'],
+                'code': skill['code'],
+                'description': skill.get('description', ''),
+                'parameters_schema': skill.get('parameters_schema'),
+            }
+    return registry
 
 
 # =============================================================================
@@ -312,16 +334,20 @@ The skill is now available for invocation via `invoke_skill`."""
 )
 async def invoke_skill(params: InvokeSkillInput) -> str:
     """Execute a stored skill by name.
-    
+
     Invokes a previously created skill, passing any provided parameters
     and context. The skill code is executed in an isolated namespace.
-    
+
     Args:
         params: InvokeSkillInput containing:
             - skill_name: Name of the skill to invoke
             - parameters: Parameters to pass to the skill
             - context: Additional context variables
-    
+            - timeout: Max execution time (default 30s)
+            - capture_output: Whether to capture stdout/stderr (default True)
+            - return_mode: SUMMARY, HANDLE, or FULL
+            - artifact_ttl_seconds: Optional TTL for outputs
+
     Returns:
         str: Execution result or error message
     """
@@ -338,11 +364,14 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
         '__skill_id__': skill['id']
     }
     
-    # Execute skill code
+    # Execute skill code with composition enabled
     result = await _execute_code_internal(
         code=skill['code'],
         context=namespace,
-        timeout=params.timeout
+        timeout=params.timeout,
+        capture_output=params.capture_output,
+        enable_composition=True,
+        current_skill_name=params.skill_name
     )
     
     # Update invocation count without rewriting the skill JSON (write amplification).
@@ -496,7 +525,9 @@ async def _execute_code_internal(
     code: str,
     context: Optional[Dict[str, Any]] = None,
     timeout: int = MAX_EXECUTION_TIME,
-    capture_output: bool = True
+    capture_output: bool = True,
+    enable_composition: bool = False,
+    current_skill_name: Optional[str] = None
 ) -> str:
     """Internal code execution implementation.
 
@@ -532,11 +563,39 @@ import sys
 from pathlib import Path
 """
 
+        exec_namespace["__helpers__"] = """
+def debug_context(**namespace_vars):
+    \"\"\"Debug helper: Print all available variables in the execution context.\"\"\"
+    import json
+    print("=== Execution Context Debug ===")
+    for key, value in sorted(namespace_vars.items()):
+        if not key.startswith('__'):
+            value_type = type(value).__name__
+            try:
+                value_preview = str(value)[:100]
+                if len(str(value)) > 100:
+                    value_preview += "..."
+            except:
+                value_preview = f"<{value_type}>"
+            print(f"  {key}: {value_type} = {value_preview}")
+    print("=" * 31)
+
+def pretty_print(obj, indent=2):
+    \"\"\"Pretty print JSON-serializable objects.\"\"\"
+    import json
+    try:
+        print(json.dumps(obj, indent=indent, default=str))
+    except Exception as e:
+        print(f"Error pretty printing: {e}")
+        print(obj)
+"""
+
         stdout_capture = StringIO()
         stderr_capture = StringIO()
 
         wrapped_code = f"""
 {exec_namespace['__imports__']}
+{exec_namespace['__helpers__']}
 
 __result__ = None
 __error__ = None
@@ -565,7 +624,14 @@ except Exception as e:
             output_parts = []
 
             if error:
-                output_parts.append(f"**Error:** {error}\n```\n{tb}\n```")
+                error_msg = f"**Error:** {error}\n```\n{tb}\n```"
+                # Add helpful debugging hint
+                if context:
+                    available_vars = [k for k in context.keys() if not k.startswith('__')]
+                    if available_vars:
+                        error_msg += f"\n**Available context variables:** {', '.join(available_vars)}"
+                error_msg += "\n**Tip:** Use `debug_context(**locals())` in your skill code to inspect available variables."
+                output_parts.append(error_msg)
             if stdout_content:
                 output_parts.append(f"**Output:**\n```\n{_sanitize_code_output(stdout_content)}\n```")
             if stderr_content:
@@ -600,6 +666,197 @@ except Exception as e:
         "from pathlib import Path\n"
     )
 
+    # Helper utilities available to all skills
+    helper_functions = '''
+def debug_context(**namespace_vars):
+    """Debug helper: Print all available variables in the execution context.
+
+    Usage in skills:
+        debug_context(**locals())
+    """
+    import json
+    print("=== Execution Context Debug ===")
+    for key, value in sorted(namespace_vars.items()):
+        if not key.startswith('__'):
+            value_type = type(value).__name__
+            try:
+                value_preview = str(value)[:100]
+                if len(str(value)) > 100:
+                    value_preview += "..."
+            except:
+                value_preview = f"<{value_type}>"
+            print(f"  {key}: {value_type} = {value_preview}")
+    print("=" * 31)
+
+def pretty_print(obj, indent=2):
+    """Pretty print JSON-serializable objects.
+
+    Usage:
+        pretty_print({"key": "value", "nested": {"data": [1, 2, 3]}})
+    """
+    import json
+    try:
+        print(json.dumps(obj, indent=indent, default=str))
+    except Exception as e:
+        print(f"Error pretty printing: {e}")
+        print(obj)
+
+
+# =============================================================================
+# Skill Composition System
+# =============================================================================
+# Note: _skill_call_stack, _skill_registry, and _max_skill_call_depth are
+# injected by the runner before these helpers are exec'd. Do NOT initialize
+# them here as that would overwrite the runner's values.
+
+def invoke_skill(skill_name, parameters=None, context=None):
+    """Invoke another skill from within a skill.
+
+    Enables skill composition - skills can call other skills to build
+    complex workflows from simple primitives.
+
+    Args:
+        skill_name: Name of the skill to invoke
+        parameters: Dict of parameters to pass (accessible as `params` in skill)
+        context: Additional context variables (accessible as `context` in skill)
+
+    Returns:
+        The value of __result__ from the invoked skill, or None
+
+    Raises:
+        RuntimeError: If skill not found, max depth exceeded, or circular call detected
+
+    Example:
+        # From within a skill:
+        domain_info = invoke_skill('domain_context_switcher', {
+            'action': 'detect',
+            'message': user_input
+        })
+        if domain_info.get('domains'):
+            session_data = invoke_skill('persistent_session_context', {
+                'action': 'recall',
+                'domain': domain_info['domains'][0]
+            })
+    """
+    # Access namespace variables through globals()
+    g = globals()
+    skill_registry = g.get('_skill_registry', {})
+    skill_call_stack = g.get('_skill_call_stack', [])
+    max_call_depth = g.get('_max_skill_call_depth', 10)
+
+    # Check if skill registry is available
+    if not skill_registry:
+        raise RuntimeError(
+            f"Skill composition not available: skill registry not loaded. "
+            f"This may happen in direct execute_code calls."
+        )
+
+    # Check call depth
+    if len(skill_call_stack) >= max_call_depth:
+        raise RuntimeError(
+            f"Maximum skill call depth ({max_call_depth}) exceeded. "
+            f"Call stack: {' -> '.join(skill_call_stack)}"
+        )
+
+    # Check for circular calls
+    if skill_name in skill_call_stack:
+        raise RuntimeError(
+            f"Circular skill invocation detected: {skill_name}. "
+            f"Call stack: {' -> '.join(skill_call_stack)} -> {skill_name}"
+        )
+
+    # Look up skill in registry
+    if skill_name not in skill_registry:
+        available = list(skill_registry.keys())[:10]
+        raise RuntimeError(
+            f"Skill '{skill_name}' not found. "
+            f"Available skills: {', '.join(available)}{'...' if len(skill_registry) > 10 else ''}"
+        )
+
+    skill = skill_registry[skill_name]
+    skill_code = skill.get('code', '')
+
+    if not skill_code:
+        raise RuntimeError(f"Skill '{skill_name}' has no code defined.")
+
+    # Push onto call stack
+    skill_call_stack.append(skill_name)
+
+    try:
+        # Create execution namespace for the child skill
+        child_namespace = {
+            '__builtins__': __builtins__,
+            '__name__': '__main__',
+            '__doc__': None,
+            '__skill_name__': skill_name,
+            '__parent_skill__': skill_call_stack[-2] if len(skill_call_stack) > 1 else None,
+            '__call_depth__': len(skill_call_stack),
+            'params': parameters or {},
+            'context': context or {},
+            # Inject composition helpers into child
+            '_skill_registry': skill_registry,
+            '_skill_call_stack': skill_call_stack,
+            '_max_skill_call_depth': max_call_depth,
+            'invoke_skill': invoke_skill,
+            'list_available_skills': list_available_skills,
+            'get_skill_info': get_skill_info,
+            'debug_context': debug_context,
+            'pretty_print': pretty_print,
+        }
+
+        # Execute the skill code
+        exec(skill_code, child_namespace)
+
+        # Return the result
+        return child_namespace.get('__result__')
+
+    finally:
+        # Pop from call stack
+        skill_call_stack.pop()
+
+
+def list_available_skills():
+    """List all skills available for composition.
+
+    Returns:
+        Dict mapping skill names to their descriptions.
+
+    Example:
+        skills = list_available_skills()
+        for name, desc in skills.items():
+            print(f"{name}: {desc}")
+    """
+    skill_registry = globals().get('_skill_registry', {})
+    if not skill_registry:
+        return {}
+    return {
+        name: skill.get('description', 'No description')
+        for name, skill in skill_registry.items()
+    }
+
+
+def get_skill_info(skill_name):
+    """Get information about a skill without invoking it.
+
+    Args:
+        skill_name: Name of the skill
+
+    Returns:
+        Dict with skill metadata, or None if not found
+    """
+    skill_registry = globals().get('_skill_registry', {})
+    if not skill_registry:
+        return None
+    skill = skill_registry.get(skill_name)
+    if skill:
+        return {
+            'name': skill.get('name'),
+            'description': skill.get('description'),
+            'parameters_schema': skill.get('parameters_schema'),
+        }
+    return None
+'''
+
     runner_source = """
 import json
 import sys
@@ -614,6 +871,9 @@ def main():
     context = payload.get("context") or {}
     result_path = payload.get("result_path")
     common_imports = payload.get("common_imports", "")
+    skill_registry = payload.get("skill_registry") or {}
+    max_call_depth = payload.get("max_call_depth", 10)
+    current_skill_name = payload.get("current_skill_name")
 
     namespace = {"__builtins__": __builtins__, "__name__": "__main__", "__doc__": None}
     if isinstance(context, dict):
@@ -624,7 +884,27 @@ def main():
     result = None
 
     try:
-        exec(common_imports + "\\n" + code, namespace)
+        # Execute common imports first
+        exec(common_imports, namespace)
+
+        # Initialize skill composition system BEFORE helpers (so invoke_skill can access them)
+        namespace["_skill_registry"] = skill_registry
+        namespace["_max_skill_call_depth"] = max_call_depth
+        namespace["_skill_call_stack"] = [current_skill_name] if current_skill_name else []
+
+        # Set user-facing context variables for the top-level skill
+        # __call_depth__ = number of skills in the call chain (1 for top-level, 2 for first child, etc.)
+        # This MUST equal len(_skill_call_stack) for consistency
+        namespace["__call_depth__"] = len(namespace["_skill_call_stack"])
+        namespace["__skill_name__"] = current_skill_name
+        namespace["__parent_skill__"] = None
+
+        # Now execute helper functions - they'll have access to the composition system
+        helpers = payload.get("helpers", "")
+        exec(helpers, namespace)
+
+        # Execute the actual code
+        exec(code, namespace)
         result = namespace.get("__result__")
     except Exception as e:
         error = str(e)
@@ -659,6 +939,10 @@ if __name__ == "__main__":
                 "context": context or {},
                 "result_path": str(result_path),
                 "common_imports": common_imports,
+                "helpers": helper_functions,
+                "skill_registry": _build_skill_registry() if enable_composition else {},
+                "max_call_depth": MAX_SKILL_CALL_DEPTH,
+                "current_skill_name": current_skill_name,
             }
             payload_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
@@ -738,7 +1022,14 @@ if __name__ == "__main__":
                     )
 
             if error:
-                output_parts.append(f"**Error:** {error}\n```\n{tb}\n```")
+                error_msg = f"**Error:** {error}\n```\n{tb}\n```"
+                # Add helpful debugging hint
+                if context:
+                    available_vars = [k for k in context.keys() if not k.startswith('__')]
+                    if available_vars:
+                        error_msg += f"\n**Available context variables:** {', '.join(available_vars)}"
+                error_msg += "\n**Tip:** Use `debug_context(**locals())` in your skill code to inspect available variables."
+                output_parts.append(error_msg)
 
             if stdout_content:
                 output_parts.append(f"**Output:**\n```\n{_sanitize_code_output(stdout_content)}\n```")

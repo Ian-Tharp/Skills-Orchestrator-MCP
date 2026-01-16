@@ -75,6 +75,10 @@ class InvokeSkillInput(BaseModel):
         ge=1,
         le=180
     )
+    capture_output: bool = Field(
+        default=True,
+        description="Whether to capture and return stdout/stderr"
+    )
     return_mode: ReturnMode = Field(
         default=ReturnMode.SUMMARY,
         description="Return mode: 'summary' (default), 'handle', or 'full'"
