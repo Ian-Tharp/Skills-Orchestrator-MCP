@@ -145,18 +145,44 @@ mcp = FastMCP("skill_orchestrator_mcp")
 # Helper Functions
 # =============================================================================
 
+_UNSAFE_NAME_CHARS = frozenset("/\\:\x00")
+
+
+def _is_safe_storage_name(name: str) -> bool:
+    """Return True if `name` can be used as a single file name in a storage dir.
+
+    Skill names and state namespaces become file names. Reject anything that
+    could escape the storage directory (path separators, `..`, drive markers,
+    NUL) or clobber internal dotfiles such as `.skill_index.json`.
+    """
+    return bool(name) and not name.startswith(".") and not (_UNSAFE_NAME_CHARS & set(name))
+
+
 def _get_skill_path(name: str) -> Path:
     """Get the file path for a skill."""
+    if not _is_safe_storage_name(name):
+        raise ValueError(f"Invalid skill name: {name!r}")
     return DEFAULT_SKILLS_DIR / f"{name}.json"
 
 
 def _get_state_path(namespace: str) -> Path:
     """Get the file path for a state namespace."""
+    if not _is_safe_storage_name(namespace):
+        raise ValueError(f"Invalid state namespace: {namespace!r}")
     return DEFAULT_STATE_DIR / f"{namespace}.json"
 
 
+def _invalid_namespace_message(namespace: str) -> str:
+    return (
+        f"Error: Invalid namespace '{namespace}'. Namespaces may not contain path "
+        "separators, ':' or start with '.'."
+    )
+
+
 def _load_skill(name: str) -> Optional[Dict[str, Any]]:
-    """Load a skill from disk."""
+    """Load a skill from disk. Unsafe names are treated as not found."""
+    if not _is_safe_storage_name(name):
+        return None
     path = _get_skill_path(name)
     if path.exists():
         with open(path, 'r') as f:
@@ -201,8 +227,14 @@ def _get_nested_value(data: Any, key: str) -> Any:
 def _set_nested_value(data: Dict[str, Any], key: str, value: Any) -> None:
     """Set a nested value using dot notation."""
     keys = key.split('.')
-    for k in keys[:-1]:
-        data = data.setdefault(k, {})
+    for i, k in enumerate(keys[:-1]):
+        child = data.setdefault(k, {})
+        if not isinstance(child, dict):
+            raise ValueError(
+                f"Cannot set '{key}': '{'.'.join(keys[: i + 1])}' holds a "
+                f"{type(child).__name__}, not an object"
+            )
+        data = child
     data[keys[-1]] = value
 
 
@@ -225,10 +257,11 @@ def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
     Returns a dict mapping skill names to their full definitions (including code).
     This enables skill composition - skills can invoke other skills during execution.
     """
-    registry = {}
-    for name, meta in SKILL_INDEX.all().items():
+    registry: Dict[str, Dict[str, Any]] = {}
+    for name in SKILL_INDEX.all():
         skill = _load_skill(name)
-        if skill:
+        # Skip malformed skill files so one bad file can't break composition.
+        if skill and isinstance(skill.get('code'), str):
             registry[name] = {
                 'name': skill['name'],
                 'code': skill['code'],
@@ -1009,6 +1042,14 @@ if __name__ == "__main__":
                 except Exception:
                     error = "Failed to read execution result payload"
 
+            # The runner only catches Exception, so sys.exit() or a hard crash
+            # (os._exit, segfault, OOM kill) ends the child without a result.
+            if not timed_out and error is None and proc.returncode not in (0, None):
+                error = (
+                    f"Process terminated with exit code {proc.returncode} "
+                    "before reporting a result"
+                )
+
             output_parts = []
 
             if timed_out:
@@ -1096,7 +1137,7 @@ async def search_skills(params: SearchSkillsInput) -> str:
         skills = [
             s for s in skills
             if query_lower in s['name'].lower()
-            or query_lower in s['description'].lower()
+            or query_lower in str(s.get('description') or '').lower()
             or any(query_lower in tag.lower() for tag in s.get('tags', []))
             or any(query_lower in ex.lower() for ex in s.get('examples', []))
         ]
@@ -1170,7 +1211,7 @@ async def search_skills(params: SearchSkillsInput) -> str:
 
     for skill in page:
         lines.append(f"### {skill['name']}")
-        lines.append(f"*{skill['description']}*\n")
+        lines.append(f"*{skill.get('description') or 'No description'}*\n")
         lines.append(f"- **Category:** {skill.get('category', 'custom')}")
         lines.append(f"- **Tags:** {', '.join(skill.get('tags', [])) or 'None'}")
         lines.append(f"- **Dependencies:** {', '.join(skill.get('dependencies', [])) or 'None'}")
@@ -1337,6 +1378,9 @@ async def delete_skill(name: str, confirm: bool = False) -> str:
     if not confirm:
         return f"⚠️ To delete skill '{name}', call delete_skill with confirm=True"
 
+    if not _is_safe_storage_name(name):
+        return f"Error: Invalid skill name '{name}'."
+
     path = _get_skill_path(name)
     if not path.exists():
         return f"Error: Skill '{name}' not found."
@@ -1381,8 +1425,14 @@ async def set_state(params: StateInput) -> str:
     Returns:
         str: Confirmation message
     """
+    if not _is_safe_storage_name(params.namespace):
+        return _invalid_namespace_message(params.namespace)
+
     state = _load_state(params.namespace)
-    _set_nested_value(state, params.key, params.value)
+    try:
+        _set_nested_value(state, params.key, params.value)
+    except ValueError as e:
+        return f"Error: {e}"
     _save_state(params.namespace, state)
 
     return f"✅ State '{params.key}' set in namespace '{params.namespace}'."
@@ -1408,6 +1458,9 @@ async def get_state(key: str, namespace: str = "default") -> str:
     Returns:
         str: The stored value or None if not found
     """
+    if not _is_safe_storage_name(namespace):
+        return _invalid_namespace_message(namespace)
+
     state = _load_state(namespace)
     value = _get_nested_value(state, key)
 
@@ -1450,6 +1503,9 @@ async def list_state(params: ListStateInput) -> str:
     Returns:
         str: Paginated list of state keys with metadata
     """
+    if not _is_safe_storage_name(params.namespace):
+        return _invalid_namespace_message(params.namespace)
+
     state = _load_state(params.namespace)
 
     if not state:
@@ -1705,6 +1761,8 @@ def get_skill_resource(name: str) -> str:
 @mcp.resource("state://{namespace}")
 def get_state_resource(namespace: str) -> str:
     """Get all state in a namespace as a resource."""
+    if not _is_safe_storage_name(namespace):
+        return json.dumps({"error": f"Invalid namespace '{namespace}'"})
     state = _load_state(namespace)
     return json.dumps(state, indent=2, default=str)
 

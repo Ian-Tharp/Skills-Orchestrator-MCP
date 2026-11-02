@@ -205,6 +205,10 @@ class ArtifactStore:
             exp = datetime.fromisoformat(str(expires_at))
         except Exception:
             return False
+        if exp.tzinfo is None:
+            # Treat naive timestamps (hand-edited/legacy meta) as UTC instead of
+            # raising on a naive vs aware comparison.
+            exp = exp.replace(tzinfo=timezone.utc)
         return _utc_now() >= exp
 
 
