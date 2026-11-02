@@ -107,7 +107,8 @@ async def test_registry_reflects_updates_and_deletes(storage: Storage) -> None:
 
     await server.update_skill("leaf_skill", code="__result__ = 'v2'")
     updated = await server.invoke_skill(InvokeSkillInput(skill_name="root_skill", return_mode=ReturnMode.FULL))
-    await server.delete_skill("leaf_skill", confirm=True)
+    # root_skill depends on leaf_skill, so deletion needs force=True.
+    await server.delete_skill("leaf_skill", confirm=True, force=True)
     deleted = await server.invoke_skill(InvokeSkillInput(skill_name="root_skill", return_mode=ReturnMode.FULL))
 
     assert "v2" in updated
