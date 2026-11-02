@@ -6,8 +6,8 @@ They demonstrate best practices and can be customized.
 """
 
 import json
-import os
 from pathlib import Path
+from typing import Any, Dict, List
 
 # Directory for skills
 SKILLS_DIR = Path.home() / ".skill_orchestrator" / "skills"
@@ -17,7 +17,7 @@ SKILLS_DIR.mkdir(parents=True, exist_ok=True)
 # Skill Definitions
 # =============================================================================
 
-BUILTIN_SKILLS = [
+BUILTIN_SKILLS: List[Dict[str, Any]] = [
     {
         "name": "json_transform",
         "description": "Transform JSON data using JSONPath-like queries and filters. Supports selecting fields, filtering arrays, and reshaping data structures.",
@@ -38,25 +38,25 @@ import json
 
 def transform(data, operations):
     result = data
-    
+
     for op in operations:
         op_type = op.get("type")
-        
+
         if op_type == "select":
             fields = op.get("fields", [])
             if isinstance(result, list):
                 result = [{k: item.get(k) for k in fields} for item in result]
             elif isinstance(result, dict):
                 result = {k: result.get(k) for k in fields}
-        
+
         elif op_type == "filter":
             conditions = op.get("conditions", {})
             if isinstance(result, list):
                 result = [
-                    item for item in result 
+                    item for item in result
                     if all(item.get(k) == v for k, v in conditions.items())
                 ]
-        
+
         elif op_type == "rename":
             mapping = op.get("mapping", {})
             if isinstance(result, list):
@@ -66,11 +66,11 @@ def transform(data, operations):
                 ]
             elif isinstance(result, dict):
                 result = {mapping.get(k, k): v for k, v in result.items()}
-        
+
         elif op_type == "flatten":
             if isinstance(result, list) and len(result) == 1:
                 result = result[0]
-    
+
     return result
 
 # Get params from context
@@ -197,13 +197,13 @@ def parse_date(date_str):
 def get_relative_date(relative_desc, base_date=None):
     base = base_date or datetime.now()
     relative_desc = relative_desc.lower()
-    
+
     # Parse relative descriptions
     day_map = {
         'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
         'friday': 4, 'saturday': 5, 'sunday': 6
     }
-    
+
     for day_name, day_num in day_map.items():
         if day_name in relative_desc:
             current_day = base.weekday()
@@ -217,7 +217,7 @@ def get_relative_date(relative_desc, base_date=None):
                 if days_behind <= 0:
                     days_behind += 7
                 return base - timedelta(days=days_behind)
-    
+
     return base
 
 operation = params.get("operation", "format")
@@ -401,7 +401,7 @@ imports = []
 class Visitor(ast.NodeVisitor):
     def __init__(self):
         self.current_function = None
-        
+
     def visit_FunctionDef(self, node):
         complexity = self._calculate_complexity(node)
         functions.append({
@@ -412,10 +412,10 @@ class Visitor(ast.NodeVisitor):
             "is_complex": complexity > threshold
         })
         self.generic_visit(node)
-    
+
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
-    
+
     def visit_ClassDef(self, node):
         methods = [n.name for n in ast.walk(node) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         classes.append({
@@ -424,16 +424,16 @@ class Visitor(ast.NodeVisitor):
             "methods": len(methods)
         })
         self.generic_visit(node)
-    
+
     def visit_Import(self, node):
         for alias in node.names:
             imports.append(alias.name)
-    
+
     def visit_ImportFrom(self, node):
         module = node.module or ""
         for alias in node.names:
             imports.append(f"{module}.{alias.name}")
-    
+
     def _calculate_complexity(self, node):
         """Calculate cyclomatic complexity for a function."""
         complexity = 1  # Base complexity
@@ -491,25 +491,25 @@ print(json.dumps(result, indent=2))
 # Installation Function
 # =============================================================================
 
-def install_builtin_skills():
+def install_builtin_skills() -> Dict[str, Any]:
     """Install all built-in skills."""
-    from datetime import datetime, timezone
     import hashlib
-    
-    installed = []
-    skipped = []
-    
+    from datetime import datetime, timezone
+
+    installed: List[str] = []
+    skipped: List[str] = []
+
     for skill_def in BUILTIN_SKILLS:
         skill_path = SKILLS_DIR / f"{skill_def['name']}.json"
-        
+
         if skill_path.exists():
             skipped.append(skill_def['name'])
             continue
-        
+
         # Generate ID
         timestamp = datetime.now(timezone.utc).isoformat()
         skill_id = hashlib.sha256(f"{skill_def['name']}:{timestamp}".encode()).hexdigest()[:12]
-        
+
         # Create full skill data
         skill_data = {
             "id": skill_id,
@@ -527,12 +527,12 @@ def install_builtin_skills():
             "invocation_count": 0,
             "builtin": True
         }
-        
+
         with open(skill_path, 'w') as f:
             json.dump(skill_data, f, indent=2)
-        
+
         installed.append(skill_def['name'])
-    
+
     return {
         "installed": installed,
         "skipped": skipped,
@@ -542,7 +542,7 @@ def install_builtin_skills():
 
 if __name__ == "__main__":
     result = install_builtin_skills()
-    print(f"Built-in skills installation complete:")
+    print("Built-in skills installation complete:")
     print(f"  Installed: {len(result['installed'])} skills")
     print(f"  Skipped (already exist): {len(result['skipped'])} skills")
     if result['installed']:

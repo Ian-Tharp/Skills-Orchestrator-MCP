@@ -18,23 +18,21 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, cast
 
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from .artifacts import ArtifactStore
-from .skill_index import SkillIndex
-from .usage_stats import UsageTracker
 from .models import (
     CreateSkillInput,
     ExecuteCodeInput,
@@ -48,6 +46,8 @@ from .models import (
     StateInput,
     StoreArtifactInput,
 )
+from .skill_index import SkillIndex
+from .usage_stats import UsageTracker
 
 # =============================================================================
 # Configuration
@@ -160,7 +160,7 @@ def _load_skill(name: str) -> Optional[Dict[str, Any]]:
     path = _get_skill_path(name)
     if path.exists():
         with open(path, 'r') as f:
-            return json.load(f)
+            return cast(Dict[str, Any], json.load(f))
     return None
 
 
@@ -176,7 +176,7 @@ def _load_state(namespace: str) -> Dict[str, Any]:
     path = _get_state_path(namespace)
     if path.exists():
         with open(path, 'r') as f:
-            return json.load(f)
+            return cast(Dict[str, Any], json.load(f))
     return {}
 
 
@@ -187,7 +187,7 @@ def _save_state(namespace: str, state: Dict[str, Any]) -> None:
         json.dump(state, f, indent=2, default=str)
 
 
-def _get_nested_value(data: Dict, key: str) -> Any:
+def _get_nested_value(data: Any, key: str) -> Any:
     """Get a nested value using dot notation."""
     keys = key.split('.')
     for k in keys:
@@ -198,7 +198,7 @@ def _get_nested_value(data: Dict, key: str) -> Any:
     return data
 
 
-def _set_nested_value(data: Dict, key: str, value: Any) -> None:
+def _set_nested_value(data: Dict[str, Any], key: str, value: Any) -> None:
     """Set a nested value using dot notation."""
     keys = key.split('.')
     for k in keys[:-1]:
@@ -244,26 +244,26 @@ def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
 
 @mcp.tool(
     name="create_skill",
-    annotations={
-        "title": "Create a New Skill",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Create a New Skill",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False
+    )
 )
 async def create_skill(params: CreateSkillInput) -> str:
     """Create and store a new reusable skill.
-    
+
     Skills are stored code patterns that can be invoked later. They enable
     progressive capability building - create a skill once, use it many times.
-    
+
     Best practices:
     - Include a main() function for entry point
     - Document parameters in the description
     - Add relevant tags for discoverability
     - Keep skills focused on a single purpose
-    
+
     Args:
         params: CreateSkillInput containing:
             - name: Unique snake_case identifier
@@ -274,7 +274,7 @@ async def create_skill(params: CreateSkillInput) -> str:
             - dependencies: Required packages
             - parameters_schema: JSON Schema for parameters
             - examples: Usage examples
-    
+
     Returns:
         str: Confirmation message with skill ID
     """
@@ -282,7 +282,7 @@ async def create_skill(params: CreateSkillInput) -> str:
     existing = _load_skill(params.name)
     if existing:
         return f"Error: Skill '{params.name}' already exists (ID: {existing['id']}). Use update_skill to modify."
-    
+
     # Create skill metadata
     skill_data = {
         "id": _generate_skill_id(params.name),
@@ -299,18 +299,18 @@ async def create_skill(params: CreateSkillInput) -> str:
         "version": 1,
         "invocation_count": 0
     }
-    
+
     # Validate code syntax
     try:
         compile(params.code, f"skill_{params.name}", 'exec')
     except SyntaxError as e:
         return f"Error: Invalid Python syntax in skill code: {e}"
-    
+
     # Save skill
     _save_skill(skill_data)
     SKILL_INDEX.upsert_from_skill(skill_data)
     USAGE_TRACKER.ensure_minimums({params.name: 0})
-    
+
     return f"""✅ Skill created successfully!
 
 **Name:** {params.name}
@@ -324,13 +324,13 @@ The skill is now available for invocation via `invoke_skill`."""
 
 @mcp.tool(
     name="invoke_skill",
-    annotations={
-        "title": "Invoke a Stored Skill",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True
-    }
+    annotations=ToolAnnotations(
+        title="Invoke a Stored Skill",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True
+    )
 )
 async def invoke_skill(params: InvokeSkillInput) -> str:
     """Execute a stored skill by name.
@@ -355,7 +355,7 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
     skill = _load_skill(params.skill_name)
     if not skill:
         return f"Error: Skill '{params.skill_name}' not found. Use search_skills to find available skills."
-    
+
     # Prepare execution namespace
     namespace = {
         'params': params.parameters or {},
@@ -363,7 +363,7 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
         '__skill_name__': params.skill_name,
         '__skill_id__': skill['id']
     }
-    
+
     # Execute skill code with composition enabled
     result = await _execute_code_internal(
         code=skill['code'],
@@ -373,10 +373,10 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
         enable_composition=True,
         current_skill_name=params.skill_name
     )
-    
+
     # Update invocation count without rewriting the skill JSON (write amplification).
     USAGE_TRACKER.increment(params.skill_name)
-    
+
     full_text = f"""## Skill Execution: {params.skill_name}
 
 {result}"""
@@ -407,35 +407,35 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
 
 @mcp.tool(
     name="execute_code",
-    annotations={
-        "title": "Execute Python Code",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True
-    }
+    annotations=ToolAnnotations(
+        title="Execute Python Code",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True
+    )
 )
 async def execute_code(params: ExecuteCodeInput) -> str:
     """Execute Python code in an isolated environment.
-    
+
     Implements the "code execution with MCP" pattern for context-efficient
     operations. Use this to:
     - Process data without passing it through context
     - Chain multiple operations efficiently
     - Perform computations locally
     - Test skill code before saving
-    
+
     Security note: Code runs in an isolated namespace but has access to
     standard library. External network calls and file operations are allowed
     but should be used carefully.
-    
+
     Args:
         params: ExecuteCodeInput containing:
             - code: Python code to execute
             - context: Variables to inject into namespace
             - timeout: Max execution time (default 30s)
             - capture_output: Whether to capture stdout/stderr
-    
+
     Returns:
         str: Execution output and results
     """
@@ -472,13 +472,13 @@ async def execute_code(params: ExecuteCodeInput) -> str:
 
 @mcp.tool(
     name="store_artifact",
-    annotations={
-        "title": "Store an Artifact (Large Output Handle)",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        title="Store an Artifact (Large Output Handle)",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
 )
 async def store_artifact(params: StoreArtifactInput) -> str:
     """Store large content out-of-band and return an artifact handle."""
@@ -500,13 +500,13 @@ async def store_artifact(params: StoreArtifactInput) -> str:
 
 @mcp.tool(
     name="get_artifact",
-    annotations={
-        "title": "Get Artifact Content (Chunked)",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        title="Get Artifact Content (Chunked)",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def get_artifact(params: GetArtifactInput) -> str:
     """Retrieve artifact content in chunks to avoid flooding context."""
@@ -621,7 +621,7 @@ except Exception as e:
             tb = exec_namespace.get("__traceback__", "")
             result = exec_namespace.get("__result__")
 
-            output_parts = []
+            output_parts: List[str] = []
 
             if error:
                 error_msg = f"**Error:** {error}\n```\n{tb}\n```"
@@ -1009,7 +1009,7 @@ if __name__ == "__main__":
                 except Exception:
                     error = "Failed to read execution result payload"
 
-            output_parts: list[str] = []
+            output_parts = []
 
             if timed_out:
                 output_parts.append(
@@ -1054,21 +1054,21 @@ if __name__ == "__main__":
 
 @mcp.tool(
     name="search_skills",
-    annotations={
-        "title": "Search Available Skills",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Search Available Skills",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def search_skills(params: SearchSkillsInput) -> str:
     """Search and discover available skills.
-    
+
     Progressive disclosure: Use this to find relevant skills before loading
     their full definitions. This keeps context efficient by only loading
     what's needed.
-    
+
     Args:
         params: SearchSkillsInput containing:
             - query: Text search across names, descriptions, tags
@@ -1076,7 +1076,7 @@ async def search_skills(params: SearchSkillsInput) -> str:
             - tags: Filter by tags
             - include_code: Whether to include full code
             - response_format: markdown or json
-    
+
     Returns:
         str: List of matching skills with metadata
     """
@@ -1089,7 +1089,7 @@ async def search_skills(params: SearchSkillsInput) -> str:
         _last_index_refresh_check_monotonic = now
 
     skills = list(SKILL_INDEX.all().values())
-    
+
     # Apply filters
     if params.query:
         query_lower = params.query.lower()
@@ -1100,16 +1100,16 @@ async def search_skills(params: SearchSkillsInput) -> str:
             or any(query_lower in tag.lower() for tag in s.get('tags', []))
             or any(query_lower in ex.lower() for ex in s.get('examples', []))
         ]
-    
+
     if params.category:
         skills = [s for s in skills if s.get('category') == params.category.value]
-    
+
     if params.tags:
         skills = [
             s for s in skills
             if any(tag in s.get('tags', []) for tag in params.tags)
         ]
-    
+
     # Sort by invocation count (most used first) using usage tracker (fast, write-light).
     skills.sort(key=lambda s: USAGE_TRACKER.get(str(s.get("name", ""))), reverse=True)
 
@@ -1124,18 +1124,18 @@ async def search_skills(params: SearchSkillsInput) -> str:
 
     # Optionally hydrate code only for the returned page.
     # Attach usage counts (index may contain legacy invocation_count, but usage is authoritative).
-    page_with_usage: list[dict] = []
+    page_with_usage: List[Dict[str, Any]] = []
     for meta in page:
         name = str(meta.get("name", ""))
         page_with_usage.append({**meta, "invocation_count": USAGE_TRACKER.get(name)})
     page = page_with_usage
 
     if params.include_code:
-        hydrated = []
+        hydrated: List[Dict[str, Any]] = []
         for meta in page:
-            name = meta.get("name")
-            if isinstance(name, str):
-                full = _load_skill(name)
+            skill_name = meta.get("name")
+            if isinstance(skill_name, str):
+                full = _load_skill(skill_name)
                 if full and "code" in full:
                     hydrated.append({**meta, "code": full.get("code")})
                 else:
@@ -1193,25 +1193,25 @@ async def search_skills(params: SearchSkillsInput) -> str:
 
 @mcp.tool(
     name="get_skill",
-    annotations={
-        "title": "Get Skill Details",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Get Skill Details",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def get_skill(name: str) -> str:
     """Get full details of a specific skill including code.
-    
+
     Use this to load a skill's complete definition when you need to:
     - Review the implementation
     - Understand parameters
     - Modify or extend the skill
-    
+
     Args:
         name: The name of the skill to retrieve
-    
+
     Returns:
         str: Full skill details in markdown format
     """
@@ -1221,11 +1221,11 @@ async def get_skill(name: str) -> str:
 
     # Overlay authoritative usage count.
     skill["invocation_count"] = USAGE_TRACKER.get(name)
-    
+
     lines = [
         f"# Skill: {skill['name']}",
         f"\n{skill['description']}\n",
-        f"## Metadata",
+        "## Metadata",
         f"- **ID:** {skill.get('id', 'unknown')}",
         f"- **Category:** {skill.get('category', 'custom')}",
         f"- **Version:** {skill.get('version', 1)}",
@@ -1235,29 +1235,29 @@ async def get_skill(name: str) -> str:
         f"- **Updated:** {skill.get('updated_at', 'unknown')}",
         f"- **Invocations:** {skill.get('invocation_count', 0)}",
     ]
-    
+
     if skill.get('parameters_schema'):
         lines.append(f"\n## Parameters Schema\n```json\n{json.dumps(skill['parameters_schema'], indent=2)}\n```")
-    
+
     if skill.get('examples'):
         lines.append("\n## Examples")
         for ex in skill['examples']:
             lines.append(f"- {ex}")
-    
+
     lines.append(f"\n## Code\n```python\n{skill['code']}\n```")
-    
+
     return "\n".join(lines)
 
 
 @mcp.tool(
     name="update_skill",
-    annotations={
-        "title": "Update an Existing Skill",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Update an Existing Skill",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False
+    )
 )
 async def update_skill(
     name: str,
@@ -1267,24 +1267,24 @@ async def update_skill(
     dependencies: Optional[List[str]] = None
 ) -> str:
     """Update an existing skill's properties.
-    
+
     Only provided fields will be updated; others remain unchanged.
     The skill version is automatically incremented.
-    
+
     Args:
         name: Name of the skill to update
         code: New Python code (optional)
         description: New description (optional)
         tags: New tags list (optional)
         dependencies: New dependencies list (optional)
-    
+
     Returns:
         str: Confirmation of update
     """
     skill = _load_skill(name)
     if not skill:
         return f"Error: Skill '{name}' not found."
-    
+
     # Update fields
     if code is not None:
         try:
@@ -1292,55 +1292,55 @@ async def update_skill(
         except SyntaxError as e:
             return f"Error: Invalid Python syntax: {e}"
         skill['code'] = code
-    
+
     if description is not None:
         skill['description'] = description
-    
+
     if tags is not None:
         skill['tags'] = tags
-    
+
     if dependencies is not None:
         skill['dependencies'] = dependencies
-    
+
     # Update metadata
     skill['updated_at'] = datetime.now(timezone.utc).isoformat()
     skill['version'] = skill.get('version', 1) + 1
-    
+
     _save_skill(skill)
     SKILL_INDEX.upsert_from_skill(skill)
-    
+
     return f"✅ Skill '{name}' updated to version {skill['version']}."
 
 
 @mcp.tool(
     name="delete_skill",
-    annotations={
-        "title": "Delete a Skill",
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Delete a Skill",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def delete_skill(name: str, confirm: bool = False) -> str:
     """Delete a skill permanently.
-    
+
     WARNING: This action cannot be undone. Set confirm=True to proceed.
-    
+
     Args:
         name: Name of the skill to delete
         confirm: Must be True to confirm deletion
-    
+
     Returns:
         str: Confirmation or error message
     """
     if not confirm:
         return f"⚠️ To delete skill '{name}', call delete_skill with confirm=True"
-    
+
     path = _get_skill_path(name)
     if not path.exists():
         return f"Error: Skill '{name}' not found."
-    
+
     path.unlink()
     SKILL_INDEX.remove(name)
     USAGE_TRACKER.remove(name)
@@ -1353,67 +1353,67 @@ async def delete_skill(name: str, confirm: bool = False) -> str:
 
 @mcp.tool(
     name="set_state",
-    annotations={
-        "title": "Store Persistent State",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Store Persistent State",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def set_state(params: StateInput) -> str:
     """Store a value in persistent state.
-    
+
     State persists across conversations and can be used to:
     - Remember preferences
     - Store intermediate results
     - Track workflow progress
     - Cache expensive computations
-    
+
     Uses dot notation for nested keys: 'user.preferences.theme'
-    
+
     Args:
         params: StateInput containing:
             - key: State key (dot notation for nesting)
             - value: JSON-serializable value to store
             - namespace: Organization namespace (default: 'default')
-    
+
     Returns:
         str: Confirmation message
     """
     state = _load_state(params.namespace)
     _set_nested_value(state, params.key, params.value)
     _save_state(params.namespace, state)
-    
+
     return f"✅ State '{params.key}' set in namespace '{params.namespace}'."
 
 
 @mcp.tool(
     name="get_state",
-    annotations={
-        "title": "Retrieve Persistent State",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Retrieve Persistent State",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def get_state(key: str, namespace: str = "default") -> str:
     """Retrieve a value from persistent state.
-    
+
     Args:
         key: State key to retrieve (dot notation supported)
         namespace: State namespace (default: 'default')
-    
+
     Returns:
         str: The stored value or None if not found
     """
     state = _load_state(namespace)
     value = _get_nested_value(state, key)
-    
+
     if value is None:
         return f"State '{key}' not found in namespace '{namespace}'."
-    
+
     if isinstance(value, (dict, list)):
         return json.dumps(value, indent=2, default=str)
     return str(value)
@@ -1421,13 +1421,13 @@ async def get_state(key: str, namespace: str = "default") -> str:
 
 @mcp.tool(
     name="list_state",
-    annotations={
-        "title": "List State Keys (Paginated)",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="List State Keys (Paginated)",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def list_state(params: ListStateInput) -> str:
     """List keys in a state namespace with pagination and context-efficient response modes.
@@ -1455,9 +1455,9 @@ async def list_state(params: ListStateInput) -> str:
     if not state:
         return f"No state found in namespace '{params.namespace}'."
 
-    def _flatten_keys(d: dict, prefix: str = "") -> List[tuple]:
+    def _flatten_keys(d: Dict[str, Any], prefix: str = "") -> List[Tuple[str, str, Any]]:
         """Flatten nested state into (key, type, value) tuples."""
-        items = []
+        items: List[Tuple[str, str, Any]] = []
         for k, v in d.items():
             key = f"{prefix}.{k}" if prefix else k
             if isinstance(v, dict):
@@ -1566,17 +1566,17 @@ async def list_state(params: ListStateInput) -> str:
 
 @mcp.tool(
     name="list_categories",
-    annotations={
-        "title": "List Skill Categories",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="List Skill Categories",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def list_categories() -> str:
     """List all available skill categories.
-    
+
     Returns:
         str: List of categories with descriptions
     """
@@ -1592,33 +1592,33 @@ async def list_categories() -> str:
         SkillCategory.UTILITY: "General utility functions",
         SkillCategory.CUSTOM: "Custom/uncategorized skills"
     }
-    
+
     lines = ["## Skill Categories\n"]
     for cat, desc in categories.items():
         lines.append(f"- **{cat.value}**: {desc}")
-    
+
     return "\n".join(lines)
 
 
 @mcp.tool(
     name="get_orchestrator_status",
-    annotations={
-        "title": "Get Orchestrator Status",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
+    annotations=ToolAnnotations(
+        title="Get Orchestrator Status",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
 )
 async def get_orchestrator_status() -> str:
     """Get the current status of the Skill Orchestrator.
-    
+
     Returns information about:
     - Number of stored skills
     - State namespaces
     - Storage locations
     - Server version
-    
+
     Returns:
         str: Status information in markdown format
     """
@@ -1631,17 +1631,17 @@ async def get_orchestrator_status() -> str:
 
     skills = list(SKILL_INDEX.all().values())
     skill_count = len(skills)
-    
+
     # Count state namespaces
     state_namespaces = len(list(DEFAULT_STATE_DIR.glob("*.json")))
-    
+
     # Get total skill invocations from usage stats (authoritative)
     total_invocations = USAGE_TRACKER.snapshot().total
     skills_by_category: Dict[str, int] = {}
     for skill in skills:
         cat = str(skill.get("category", "custom"))
         skills_by_category[cat] = skills_by_category.get(cat, 0) + 1
-    
+
     return f"""# Skill Orchestrator Status
 
 **Version:** skill_orchestrator_mcp v0.1.0
@@ -1737,7 +1737,7 @@ def get_artifact_resource(artifact_id: str) -> str:
 # Entry Point
 # =============================================================================
 
-def run_server():
+def run_server() -> None:
     """Run the MCP server."""
     mcp.run()
 

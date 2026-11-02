@@ -14,15 +14,14 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
-
+from typing import Dict
 
 DEFAULT_FLUSH_INTERVAL_SECONDS = 10.0
 DEFAULT_MAX_UPDATES_BEFORE_FLUSH = 25
 DEFAULT_USAGE_FILENAME = ".skill_usage.json"  # dotfile so it won't match "*.json" globs
 
 
-def _atomic_write_json(path: Path, data: dict) -> None:
+def _atomic_write_json(path: Path, data: Dict[str, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
