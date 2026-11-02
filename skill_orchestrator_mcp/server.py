@@ -1027,8 +1027,13 @@ if __name__ == "__main__":
             stdout_content = ""
             stderr_content = ""
             if capture_output:
-                stdout_content = (stdout_b or b"").decode("utf-8", errors="replace")
-                stderr_content = (stderr_b or b"").decode("utf-8", errors="replace")
+                # Normalize Windows CRLF so output (and truncation counts) match across platforms.
+                stdout_content = (
+                    (stdout_b or b"").decode("utf-8", errors="replace").replace("\r\n", "\n")
+                )
+                stderr_content = (
+                    (stderr_b or b"").decode("utf-8", errors="replace").replace("\r\n", "\n")
+                )
 
             error = None
             tb = ""
