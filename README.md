@@ -10,8 +10,10 @@ A self-evolving MCP (Model Context Protocol) server that enables AI agents to dy
 - [Key Capabilities](#key-capabilities)
 - [Why This Matters: Token Efficiency & Context Management](#why-this-matters-token-efficiency--context-management)
 - [How AI Agents Can Leverage This System](#how-ai-agents-can-leverage-this-system)
-- [Available Tools](#available-tools-15-mcp-tools)
+- [Available Tools](#available-tools-19-mcp-tools)
 - [Skill Composition System](#skill-composition-system)
+- [State Bridge](#state-bridge)
+- [Safe Self-Editing: Versions, Contracts, Telemetry](#safe-self-editing-versions-contracts-telemetry)
 - [Debugging & Development](#debugging--development)
 - [Configuration](#configuration)
 - [Storage Architecture](#storage-architecture)
@@ -47,7 +49,8 @@ This isn't just a tool server - it's infrastructure for **AI self-improvement** 
 - **Search** skills by name, description, category, or tags (progressive discovery)
 - **Invoke** skills with parameters
 - **Compose** skills by calling other skills (skill chaining)
-- **Version** skills automatically on updates
+- **Version** every edit, diff versions, and roll back a bad change
+- **Enforce** declared Python dependencies and a JSON Schema for parameters
 
 ### Code Execution Engine
 - **Execute** Python code in isolated subprocess environments
@@ -60,7 +63,12 @@ This isn't just a tool server - it's infrastructure for **AI self-improvement** 
 - **Store** state across conversations with dot-notation keys
 - **Organize** with namespaces for different projects/domains
 - **Track** workflow progress, preferences, and decisions
-- **Share** state between skills and sessions
+- **Share** state between skills and sessions: skills read and write it directly via the state bridge, and writes commit only if the run succeeds
+
+### Execution Telemetry
+- **Record** every run (top-level, nested and `execute_code`) with status, latency and error
+- **Compare** success rate and latency per skill version after an edit
+- **Spot** failing skills from `get_orchestrator_status`
 
 ### Artifact System (Out-of-Band Storage)
 - **Store** large outputs without flooding context
@@ -169,7 +177,7 @@ __result__ = {
 
 ---
 
-## Available Tools (15 MCP Tools)
+## Available Tools (19 MCP Tools)
 
 ### Skill Management
 
@@ -177,10 +185,18 @@ __result__ = {
 |------|-------------|
 | `create_skill` | Create a new reusable skill with code, metadata, and examples |
 | `invoke_skill` | Execute a stored skill with parameters and context |
-| `get_skill` | Get full skill details including code |
-| `update_skill` | Update an existing skill's code, description, or tags |
-| `delete_skill` | Delete a skill permanently |
+| `get_skill` | Get full skill details including code (optionally a past `version`) |
+| `update_skill` | Update code, description, tags, dependencies, schema, category or examples; saves a new version |
+| `delete_skill` | Delete a skill permanently (refused if other skills call it, unless `force=True`) |
 | `search_skills` | Search and filter skills with pagination |
+
+### Versioning
+
+| Tool | Description |
+|------|-------------|
+| `list_skill_versions` | Version history with per-version runs, failure rate and latency |
+| `diff_skill_versions` | Metadata changes and a unified code diff between two versions |
+| `rollback_skill` | Restore an earlier version's content (saved as a new version) |
 
 ### Code Execution
 
@@ -202,6 +218,7 @@ __result__ = {
 | `set_state` | Store a value in persistent state (dot notation supported) |
 | `get_state` | Retrieve a value from state |
 | `list_state` | List all keys in a namespace with pagination |
+| `delete_state` | Delete a key (and everything under it) |
 
 ### Utilities
 
@@ -209,6 +226,7 @@ __result__ = {
 |------|-------------|
 | `list_categories` | List available skill categories |
 | `get_orchestrator_status` | Get server status, statistics, and storage info |
+| `get_skill_stats` | Execution telemetry: overview of all skills, or one skill's totals, per-version breakdown and recent runs |
 
 ### MCP Resources
 
@@ -239,7 +257,12 @@ info = get_skill_info('some_skill')
 # __call_depth__ - Current nesting depth (1 for top-level, 2 for first child, etc.)
 # __parent_skill__ - Name of the calling skill (None for top-level)
 # __skill_name__ - Current skill's name
+# __skill_version__ - Version of the skill that is running
 ```
+
+Nested calls are held to the same contracts as top-level ones: a child with
+unmet dependencies raises `RuntimeError`, and parameters that fail the child's
+`parameters_schema` raise `ValueError`.
 
 ### Safety Features
 
@@ -290,6 +313,98 @@ __result__ = {
     "tags": ["assistant", "composition", "context-aware"]
 })
 ```
+
+---
+
+## State Bridge
+
+Skills (and `execute_code`) can use the same persistent state as the
+`get_state` / `set_state` tools, without a round trip through the agent:
+
+```python
+count = get_state('stats.runs', namespace='my_project', default=0)
+set_state('stats.runs', count + 1, namespace='my_project')
+delete_state('scratch', namespace='my_project')       # True if it existed
+keys = list_state_keys('my_project')                  # ['stats.runs', ...]
+```
+
+How writes behave:
+
+- **All or nothing.** Writes are buffered and committed only when the whole
+  run succeeds. If the skill raises or times out, nothing is written and the
+  output says how many writes were discarded.
+- **Nested rollback.** If a child skill raises and the parent catches it, the
+  child's writes are rolled back; the parent's are kept.
+- **Read your writes.** Within a run, `get_state` sees pending writes.
+- **Merge, not overwrite.** On commit, the run's operations are replayed onto
+  the current file, so keys the skill didn't touch (for example, written by
+  another agent meanwhile) are preserved. Last writer wins per key.
+- Values must be JSON-serializable (checked at `set_state` time). Namespaces
+  follow the same rules as the tools (no path separators, no leading dot).
+
+The legacy in-process mode (`SKILL_ORCHESTRATOR_EXEC_MODE=inprocess`) does not
+provide the state bridge or composition.
+
+---
+
+## Safe Self-Editing: Versions, Contracts, Telemetry
+
+These features let an agent edit its own skills without fear of silently
+breaking them.
+
+### Version history and rollback
+
+Every create, update and rollback saves a full snapshot
+(`skills/.versions/<name>/v<N>.json`, newest 50 kept by default).
+
+```python
+update_skill(name="csv_summary", code=new_code, change_note="stream rows",
+             expected_version=3)            # refused if someone else edited it first
+list_skill_versions("csv_summary")          # runs / failure rate / p50 per version
+diff_skill_versions("csv_summary", from_version=3)
+rollback_skill("csv_summary", version=3)    # saved as v5; the rollback can be undone too
+```
+
+An update that changes nothing does not create a version.
+
+### Contracts: dependencies and parameter schemas
+
+- **`dependencies`** are requirement strings (`"pandas"`, `"requests>=2.31"`).
+  They are checked against the interpreter that runs skills. Unparseable
+  strings are rejected at create/update; unmet ones produce a warning, and the
+  skill is refused at invoke time with an install hint instead of failing
+  mid-run with `ImportError`.
+- **`parameters_schema`** must be a valid JSON Schema for an object. Every
+  invocation is validated against it before the skill runs, and top-level
+  `default` values are filled in. Control this with
+  `SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT` (`strict`, `warn`, `off`). Legacy
+  skills whose stored schema is invalid run with a warning.
+- **Skill-to-skill references** (`invoke_skill('name', ...)` with a literal
+  name) are detected: create/update warns about unknown skills, `get_skill`
+  lists them, and `delete_skill` refuses to delete a skill others call unless
+  `force=True`.
+
+Runs refused by a contract are recorded in telemetry with status `rejected`.
+
+### Execution telemetry
+
+Every run is appended to `~/.skill_orchestrator/telemetry/executions.jsonl`
+(local only, capped at 10,000 records) with timestamp, skill, version, status
+(`ok`, `error`, `timeout`, `rejected`), wall-clock and in-child execution time,
+error summary, parent skill and depth for nested calls, and the number of
+state writes committed.
+
+```python
+get_skill_stats()                  # table of all skills + last errors
+get_skill_stats("csv_summary")     # totals, per-version breakdown, recent runs
+```
+
+The typical loop after an edit: invoke a few times, check
+`list_skill_versions` or `get_skill_stats`, and `rollback_skill` if the new
+version's failure rate went up.
+
+Nested calls made by a run that times out are not recorded (the child process
+is killed before it can report them); the top-level timeout is.
 
 ---
 
@@ -348,6 +463,10 @@ When skills fail, error messages include:
 | `SKILL_ORCHESTRATOR_TERMINATION_GRACE_SECONDS` | 5 | Grace period before force-kill |
 | `SKILL_ORCHESTRATOR_MAX_CALL_DEPTH` | 10 | Maximum skill nesting depth |
 | `SKILL_ORCHESTRATOR_EXEC_MODE` | subprocess | Execution mode (subprocess or inprocess) |
+| `SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT` | strict | Parameter schema checks: `strict` (reject), `warn` (run and report), `off` |
+| `SKILL_ORCHESTRATOR_TELEMETRY` | on | Set to `off` to stop recording executions |
+| `SKILL_ORCHESTRATOR_TELEMETRY_MAX_RECORDS` | 10000 | Telemetry log size cap (oldest records dropped) |
+| `SKILL_ORCHESTRATOR_MAX_SKILL_VERSIONS` | 50 | Snapshots kept per skill |
 
 ### Timeout Configuration
 
@@ -369,9 +488,13 @@ await invoke_skill({
 ├── skills/
 │   ├── skill_name.json          # Full skill definition (name, code, metadata)
 │   ├── .skill_index.json        # Metadata-only index (fast search, excludes code)
-│   └── .skill_usage.json        # Invocation counts (write-light tracking)
+│   ├── .skill_usage.json        # Invocation counts (write-light tracking)
+│   └── .versions/
+│       └── skill_name/v1.json   # Full snapshot of every saved version
 ├── state/
 │   └── namespace_name.json      # Key-value pairs for each namespace
+├── telemetry/
+│   └── executions.jsonl         # One line per execution (capped)
 ├── sessions/                     # Reserved for future use
 └── artifacts/
     ├── {id}.meta.json           # Artifact metadata (MIME type, size, TTL)
@@ -602,6 +725,7 @@ await list_state({
 - Execution timeout enforced via process boundary (can't be bypassed)
 - Standard library access (use carefully for network/file operations)
 - Output truncation prevents memory issues
+- Skills can read and write persistent state through the state bridge; namespaces are validated the same way as the MCP tools, so a skill cannot write outside the state directory through it (it can still use the filesystem directly, see above)
 - Graceful termination with configurable grace period
 
 ```bash
@@ -620,11 +744,13 @@ await list_state({
 - [x] Skill composition and chaining (Implemented!)
 - [ ] Built-in skill templates for common patterns
 - [ ] Remote skill sharing and discovery
-- [ ] Execution analytics and performance tracking
+- [x] Execution analytics and performance tracking (Implemented!)
 - [ ] OAuth integration for API-connected skills
 - [ ] WebSocket transport for streaming outputs
 - [ ] Semantic skill discovery (embedding-based search)
-- [ ] Skill versioning with rollback support
+- [x] Skill versioning with rollback support (Implemented!)
+- [x] Dependency and parameter-schema enforcement (Implemented!)
+- [x] State bridge: persistent state from inside skills (Implemented!)
 - [ ] Skill testing framework
 
 ---
