@@ -15,8 +15,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
-
+from typing import Any, Dict, Optional
 
 DEFAULT_MAX_ARTIFACT_BYTES = 5 * 1024 * 1024  # 5 MiB
 DEFAULT_CHUNK_BYTES = 10_000  # for tool responses
@@ -117,7 +116,7 @@ class ArtifactStore:
 
         return ref
 
-    def get_meta(self, artifact_id: str) -> Optional[dict]:
+    def get_meta(self, artifact_id: str) -> Optional[Dict[str, Any]]:
         ref = self._ref(artifact_id)
         if not ref.meta_path.exists():
             return None
@@ -125,6 +124,8 @@ class ArtifactStore:
             with ref.meta_path.open("r", encoding="utf-8") as f:
                 meta = json.load(f)
         except Exception:
+            return None
+        if not isinstance(meta, dict):
             return None
 
         if self._is_expired(meta):
@@ -138,7 +139,7 @@ class ArtifactStore:
         *,
         start: int = 0,
         limit: int = DEFAULT_CHUNK_BYTES,
-    ) -> Optional[dict]:
+    ) -> Optional[Dict[str, Any]]:
         meta = self.get_meta(artifact_id)
         if meta is None:
             return None
@@ -196,7 +197,7 @@ class ArtifactStore:
         )
 
     @staticmethod
-    def _is_expired(meta: dict) -> bool:
+    def _is_expired(meta: Dict[str, Any]) -> bool:
         expires_at = meta.get("expires_at")
         if not expires_at:
             return False
@@ -204,6 +205,10 @@ class ArtifactStore:
             exp = datetime.fromisoformat(str(expires_at))
         except Exception:
             return False
+        if exp.tzinfo is None:
+            # Treat naive timestamps (hand-edited/legacy meta) as UTC instead of
+            # raising on a naive vs aware comparison.
+            exp = exp.replace(tzinfo=timezone.utc)
         return _utc_now() >= exp
 
 

@@ -18,8 +18,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
-
+from typing import Any, Dict, Mapping, Optional
 
 INDEX_SCHEMA_VERSION = 1
 DEFAULT_INDEX_FILENAME = ".skill_index.json"

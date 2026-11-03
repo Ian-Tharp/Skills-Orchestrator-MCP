@@ -58,13 +58,17 @@ target-version = ["py310", "py311", "py312"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+filterwarnings = ["error"]
 
 [tool.mypy]
 python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-ignore_missing_imports = true
+files = ["skill_orchestrator_mcp"]
+strict = true
+warn_unreachable = true
+# Every dependency (mcp, pydantic, httpx) ships type information, so no
+# ignore_missing_imports is needed. Keep it that way.
 
 [dependency-groups]
 dev = [
