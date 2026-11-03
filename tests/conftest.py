@@ -78,3 +78,15 @@ def storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Storage
     # Force search_skills to re-check the directory on its next call.
     monkeypatch.setattr(server, "_last_index_refresh_check_monotonic", 0.0)
     yield s
+
+
+@pytest.fixture(autouse=True)
+def _default_trust_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test starts in the default tier with no limit overrides."""
+    for name in (
+        "SKILL_ORCHESTRATOR_TRUST_TIER",
+        "SKILL_ORCHESTRATOR_MEMORY_LIMIT_MB",
+        "SKILL_ORCHESTRATOR_FILE_SIZE_LIMIT_MB",
+        "SKILL_ORCHESTRATOR_ALLOW_SUBPROCESSES",
+    ):
+        monkeypatch.delenv(name, raising=False)

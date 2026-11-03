@@ -20,7 +20,6 @@ import hashlib
 import importlib.metadata
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -35,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import fileio, sandbox_env, skill_md
+from . import fileio, process_tree, sandbox_env, skill_md, trust_tiers
 from . import skill_contracts as contracts
 from . import skill_verification as verification
 from .artifacts import ArtifactStore
@@ -442,7 +441,7 @@ def _registry_entry(name: str, skill: Dict[str, Any], enforce_deps: bool) -> Dic
     }
 
 
-def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
+def _build_skill_registry(verified_only: bool = False) -> Dict[str, Dict[str, Any]]:
     """Build a registry of all skills for subprocess injection.
 
     Returns a dict mapping skill names to their full definitions (including code).
@@ -455,6 +454,8 @@ def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
         try:
             skill = _load_skill(name)
             if not isinstance(skill, dict) or not isinstance(skill.get('code'), str):
+                continue
+            if verified_only and verification.skill_status(skill) != verification.STATUS_VERIFIED:
                 continue
             registry[name] = _registry_entry(name, skill, enforce_deps)
         except Exception:
@@ -853,6 +854,9 @@ async def create_skill(params: CreateSkillInput) -> str:
     Returns:
         str: Confirmation message with skill ID
     """
+    policy = trust_tiers.current_policy()
+    if not policy.allows_tool("create_skill"):
+        return policy.refusal("create_skill")
     error, skill_data, warnings = await asyncio.to_thread(_prepare_create, params)
     if error:
         return error
@@ -920,6 +924,15 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
             error=reason,
         )
         return f"Error: {reason}"
+
+    policy = trust_tiers.current_policy()
+    if policy.verified_skills_only and (
+        verification.skill_status(skill) != verification.STATUS_VERIFIED
+    ):
+        return await _reject(
+            f"Skill '{params.skill_name}' is {verification.skill_status(skill)}; the "
+            f"{policy.describe_tier()} trust tier only runs verified skills."
+        )
 
     # Contract 1: Python dependencies must be importable by the runner interpreter.
     dep_mode = contracts.dependency_enforcement_mode()
@@ -1031,10 +1044,12 @@ async def execute_code(params: ExecuteCodeInput) -> str:
     - Perform computations locally
     - Test skill code before saving
 
-    Security note: Code runs in a separate Python process with a timeout and
-    an allowlisted environment (no API keys or other server env vars). It is
-    NOT a sandbox: it runs as the server's user, with the same filesystem and
-    network access.
+    Security note: Code runs in a separate Python process with a timeout, an
+    allowlisted environment (no API keys or other server env vars) and the
+    resource limits of the operator's trust tier; everything it starts is
+    killed when it ends. It is NOT a sandbox: it runs as the server's user,
+    with the same filesystem and network access. Disabled in the restricted
+    trust tier.
 
     Args:
         params: ExecuteCodeInput containing:
@@ -1046,6 +1061,9 @@ async def execute_code(params: ExecuteCodeInput) -> str:
     Returns:
         str: Execution output and results
     """
+    policy = trust_tiers.current_policy()
+    if not policy.allows_tool("execute_code"):
+        return policy.refusal("execute_code")
     outcome = await _run_code(
         code=params.code,
         context=params.context,
@@ -1811,14 +1829,82 @@ def get_skill_info(skill_name):
 
 _RUNNER_SOURCE = """
 import json
+import os
 import sys
 import time
 import traceback
+
+def _wait_for_start_gate(path, timeout=30.0):
+    # Windows: the server writes this file once the process is inside its job
+    # object, so no skill code runs outside the job.
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.005)
+    return True
+
+def _apply_limits(limits):
+    # POSIX resource limits; returns the limits that could not be applied.
+    # Hard limits are lowered too, so skill code cannot raise them again.
+    failures = []
+    if not limits or os.name == "nt":
+        return failures
+    try:
+        import resource
+    except ImportError:
+        return ["resource limits (no resource module)"]
+
+    def _set(name, value, label):
+        rid = getattr(resource, name, None)
+        if rid is None:
+            failures.append(f"{label} ({name} not available)")
+            return
+        try:
+            soft, hard = resource.getrlimit(rid)
+            if hard != resource.RLIM_INFINITY and hard < value:
+                value = hard
+            resource.setrlimit(rid, (value, value))
+        except (OSError, ValueError) as e:
+            failures.append(f"{label} ({type(e).__name__}: {e})")
+
+    mb = 1024 * 1024
+    if limits.get("memory_mb"):
+        _set("RLIMIT_AS", int(limits["memory_mb"]) * mb, "memory")
+    if limits.get("file_size_mb"):
+        _set("RLIMIT_FSIZE", int(limits["file_size_mb"]) * mb, "file size")
+    if limits.get("allow_subprocesses") is False:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            failures.append("subprocesses (RLIMIT_NPROC is not enforced for root)")
+        else:
+            _set("RLIMIT_NPROC", 0, "subprocesses")
+    return failures
 
 def main():
     payload_path = sys.argv[1]
     with open(payload_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
+
+    gate = payload.get("start_gate")
+    if gate and not _wait_for_start_gate(gate):
+        sys.exit(70)
+
+    limit_failures = _apply_limits(payload.get("limits"))
+    if limit_failures and payload.get("limits_required"):
+        result_path = payload.get("result_path")
+        if result_path:
+            with open(result_path, "w", encoding="utf-8") as rf:
+                json.dump({
+                    "error": "Refused to run: required resource limits could not be applied: "
+                    + "; ".join(limit_failures),
+                    "error_type": "SandboxLimitError",
+                    "traceback": None,
+                    "result": None,
+                    "state_ops": [],
+                    "state_ops_discarded": 0,
+                    "trace": [],
+                }, rf)
+        sys.exit(0)
 
     code = payload.get("code", "")
     context = payload.get("context") or {}
@@ -1927,6 +2013,7 @@ def main():
         "state_ops": state_ops if error is None else [],
         "state_ops_discarded": len(state_ops) if error is not None else 0,
         "trace": skill_trace,
+        "limit_failures": limit_failures,
     }
     if result_path:
         try:
@@ -1975,8 +2062,10 @@ async def _run_code(
     writes are dropped even when the run succeeds (verification runs).
     """
 
+    policy = trust_tiers.current_policy()
     exec_mode = os.environ.get("SKILL_ORCHESTRATOR_EXEC_MODE", "subprocess").strip().lower()
-    if exec_mode == "inprocess":
+    # The restricted tier never runs code inside the server.
+    if exec_mode == "inprocess" and policy.allow_inprocess:
         return _run_inprocess(code, context, capture_output)
 
     # -------------------- Subprocess execution path (default) --------------------
@@ -1996,6 +2085,7 @@ async def _run_code(
             result_path = tmp_dir / "result.json"
 
             runner_path.write_text(_RUNNER_SOURCE, encoding="utf-8")
+            tree = process_tree.ProcessTree(policy.limits, tmp_dir)
 
             payload = {
                 "code": code,
@@ -2004,7 +2094,12 @@ async def _run_code(
                 "common_imports": _COMMON_IMPORTS,
                 "helpers": _HELPER_FUNCTIONS,
                 "skill_registry": (
-                    {**(await asyncio.to_thread(_build_skill_registry)), **(registry_overrides or {})}
+                    {
+                        **(await asyncio.to_thread(
+                            _build_skill_registry, policy.verified_skills_only
+                        )),
+                        **(registry_overrides or {}),
+                    }
                     if enable_composition
                     else {}
                 ),
@@ -2012,6 +2107,9 @@ async def _run_code(
                 "current_skill_name": current_skill_name,
                 "state_dir": str(DEFAULT_STATE_DIR),
                 "schema_enforcement": contracts.schema_enforcement_mode(),
+                "limits": policy.limits.to_payload(),
+                "limits_required": policy.limits_required,
+                "start_gate": tree.start_gate,
             }
             payload_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
@@ -2022,17 +2120,10 @@ async def _run_code(
                 stdout_opt = asyncio.subprocess.DEVNULL
                 stderr_opt = asyncio.subprocess.DEVNULL
 
-            # Windows hardening:
-            # - stdin=DEVNULL prevents child code from blocking on input()
-            # - creationflags prevent console window creation + helps termination semantics
-            # - close_fds reduces inherited handle surprises with stdio-based MCP servers
-            creationflags = 0
-            if os.name == "nt":
-                if hasattr(subprocess, "CREATE_NO_WINDOW"):
-                    creationflags |= subprocess.CREATE_NO_WINDOW
-                if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-                    creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
-
+            # The run is the root of its own process tree (POSIX session /
+            # Windows job object). The whole tree is killed when the run ends.
+            # stdin=DEVNULL keeps input() from blocking; close_fds avoids
+            # leaking the stdio MCP transport's handles into the child.
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
                 str(runner_path),
@@ -2043,25 +2134,67 @@ async def _run_code(
                 cwd=str(tmp_dir),
                 # Never inherit the server's environment: it may hold the
                 # client's API keys. Only allowlisted names reach the child.
-                env=sandbox_env.build_child_env(),
+                env=sandbox_env.build_child_env(
+                    allow_passthrough=policy.allow_env_passthrough
+                ),
                 close_fds=True,
-                creationflags=creationflags,
+                **tree.popen_kwargs(),
             )
-
-            timed_out = False
-            kill_failed = False
+            readers: List["asyncio.Future[bytes]"] = []
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                timed_out = True
-                proc.kill()
-                try:
-                    stdout_b, stderr_b = await asyncio.wait_for(
-                        proc.communicate(), timeout=SUBPROCESS_TERMINATION_GRACE_SECONDS
+                setup_error = tree.attach(proc.pid)
+                if setup_error and policy.limits_required:
+                    await tree.kill()
+                    return ExecutionOutcome(
+                        text=(
+                            "**Error:** Refused to run: the "
+                            f"{policy.describe_tier()} trust tier requires resource "
+                            f"limits, but {setup_error}."
+                        ),
+                        status=STATUS_ERROR,
+                        duration_ms=_elapsed_ms(),
+                        error=f"SandboxLimitError: {setup_error}",
                     )
-                except asyncio.TimeoutError:
-                    kill_failed = True
-                    stdout_b, stderr_b = b"", b""
+
+                readers = [
+                    asyncio.ensure_future(stream.read())
+                    for stream in (proc.stdout, proc.stderr)
+                    if stream is not None
+                ]
+                timed_out = not await process_tree.wait_for_exit(proc, timeout)
+                # Always kill the tree: on timeout that stops the run, after a
+                # normal exit it ends background processes the code started
+                # (which would also hold the output pipes open).
+                await tree.kill()
+                kill_failed = not await process_tree.wait_for_exit(
+                    proc, SUBPROCESS_TERMINATION_GRACE_SECONDS
+                )
+                outputs: List[bytes] = []
+                if readers:
+                    done, pending = await asyncio.wait(
+                        readers, timeout=SUBPROCESS_TERMINATION_GRACE_SECONDS
+                    )
+                    for r in pending:
+                        r.cancel()
+                    outputs = [
+                        r.result() if r in done and r.exception() is None else b""
+                        for r in readers
+                    ]
+                stdout_b = outputs[0] if outputs else b""
+                stderr_b = outputs[1] if len(outputs) > 1 else b""
+                if not kill_failed:
+                    # Reap the process (returns at once: it has exited and
+                    # its pipes are closed or abandoned).
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                # Also reached when the request is cancelled mid-run.
+                tree.close()
+                for r in readers:
+                    if not r.done():
+                        r.cancel()
 
             stdout_content = ""
             stderr_content = ""
@@ -2083,9 +2216,14 @@ async def _run_code(
             discarded = 0
             trace: List[Dict[str, Any]] = []
             result_note: Optional[str] = None
+            limit_warnings: List[str] = list(tree.warnings)
             if result_path.exists():
                 try:
                     result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+                    limit_warnings.extend(
+                        f"resource limit not applied: {f}"
+                        for f in (result_payload.get("limit_failures") or [])
+                    )
                     error = result_payload.get("error")
                     error_type = result_payload.get("error_type")
                     tb = result_payload.get("traceback") or ""
@@ -2167,6 +2305,11 @@ async def _run_code(
 
             if state_note:
                 output_parts.append(state_note)
+
+            if limit_warnings:
+                output_parts.append(
+                    "**Sandbox warning:** " + "; ".join(limit_warnings)
+                )
 
             if not output_parts:
                 output_parts.append("*Code executed successfully with no output.*")
@@ -2684,6 +2827,9 @@ async def update_skill(
     Returns:
         str: Confirmation of update
     """
+    policy = trust_tiers.current_policy()
+    if not policy.allows_tool("update_skill"):
+        return policy.refusal("update_skill")
     args = (
         name, code, description, tags, dependencies, parameters_schema,
         category, examples, expected_version,
@@ -2823,6 +2969,9 @@ async def delete_skill(name: str, confirm: bool = False, force: bool = False) ->
     Returns:
         str: Confirmation or error message
     """
+    policy = trust_tiers.current_policy()
+    if not policy.allows_tool("delete_skill"):
+        return policy.refusal("delete_skill")
     return await asyncio.to_thread(_delete_skill_locked, name, confirm, force)
 
 
@@ -2921,6 +3070,9 @@ async def import_skill(
     Returns:
         str: create_skill's result, or why the folder could not be read
     """
+    policy = trust_tiers.current_policy()
+    if not policy.allows_tool("import_skill"):
+        return policy.refusal("import_skill")
     source, error = _portable_path(path)
     if error or source is None:
         return error or "Error: invalid path."
@@ -3148,6 +3300,9 @@ async def rollback_skill(name: str, version: int, expected_version: Optional[int
     Returns:
         str: Confirmation with the new version number
     """
+    policy = trust_tiers.current_policy()
+    if not policy.allows_tool("rollback_skill"):
+        return policy.refusal("rollback_skill")
     return await asyncio.to_thread(_rollback_skill_locked, name, version, expected_version)
 
 
@@ -3659,6 +3814,35 @@ async def get_orchestrator_status() -> str:
         )
     )
 
+    policy = trust_tiers.current_policy()
+    exec_mode = os.environ.get("SKILL_ORCHESTRATOR_EXEC_MODE", "subprocess").strip().lower()
+    trust_lines = [
+        f"- **Tier:** {policy.describe_tier()} (set by {trust_tiers.TRUST_TIER_ENV})",
+        *(
+            f"- **{label.capitalize()} limit:** {text}"
+            for label, text in trust_tiers.describe_limits(policy.limits).items()
+        ),
+        "- **Process tree:** killed when each run ends (timeout or not)",
+    ]
+    if policy.restricted:
+        trust_lines += [
+            f"- **Refused tools:** {', '.join(trust_tiers.RESTRICTED_TOOLS)}",
+            "- **Runs:** verified skills only; env passthrough ignored; "
+            "a limit that cannot be enforced refuses the run",
+        ]
+        if exec_mode == "inprocess":
+            trust_lines.append(
+                "- **Note:** SKILL_ORCHESTRATOR_EXEC_MODE=inprocess is ignored in this tier"
+            )
+    elif exec_mode == "inprocess":
+        trust_lines.append(
+            "- **Warning:** in-process mode is on; no limits, env scrub or tree kill apply"
+        )
+    for name, raw in policy.invalid_overrides:
+        trust_lines.append(f"- **Ignored invalid setting:** {name}={raw!r}")
+    if not policy.allow_env_passthrough and env_info["passthrough"]:
+        sandbox_lines += " (ignored in this tier)"
+
     if TELEMETRY.enabled:
         overview = TELEMETRY.all_stats()
         recorded = sum(s["runs"] for s in overview.values())
@@ -3697,6 +3881,9 @@ async def get_orchestrator_status() -> str:
 
 ## Sandbox
 {sandbox_lines}
+
+## Trust Tier
+{chr(10).join(trust_lines)}
 
 ## Skills by Category
 {chr(10).join(f'- **{cat}:** {count}' for cat, count in sorted(skills_by_category.items()))}

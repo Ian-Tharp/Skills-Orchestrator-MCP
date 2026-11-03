@@ -38,6 +38,11 @@ jobs:
       - name: Mypy (strict, config in pyproject.toml)
         run: uv run mypy
 
+      - name: Mypy, Windows and macOS code paths
+        run: |
+          uv run mypy --platform win32
+          uv run mypy --platform darwin
+
   test:
     name: Tests (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}

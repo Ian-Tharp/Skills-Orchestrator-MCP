@@ -593,6 +593,10 @@ When skills fail, error messages include:
 | `SKILL_ORCHESTRATOR_DEGRADED_WINDOW` | 20 | Number of recent runs (of the current version) considered |
 | `SKILL_ORCHESTRATOR_DEGRADED_MIN_RUNS` | 5 | Minimum recent runs before a skill can be degraded |
 | `SKILL_ORCHESTRATOR_PORTABLE_ROOT` | (unset) | If set, `export_skill` / `import_skill` only accept paths inside this folder |
+| `SKILL_ORCHESTRATOR_TRUST_TIER` | standard | `trusted`, `standard` or `restricted` (see [Trust tiers](#trust-tiers)). An unknown value means `restricted` |
+| `SKILL_ORCHESTRATOR_MEMORY_LIMIT_MB` | per tier | Override the tier's memory limit (`0`/`off` = none) |
+| `SKILL_ORCHESTRATOR_FILE_SIZE_LIMIT_MB` | per tier | Override the tier's largest-file-written limit (`0`/`off` = none; POSIX only) |
+| `SKILL_ORCHESTRATOR_ALLOW_SUBPROCESSES` | per tier | `on`/`off`: override whether skills may start processes |
 
 ### Timeout Configuration
 
@@ -856,7 +860,9 @@ Treat the server as having the permissions of that user.
 | Protection | Details |
 |---|---|
 | **Separate process** | Each run is a fresh `python` subprocess in a throwaway temp directory, with `stdin` closed. A crash or `sys.exit()` can't take down the server. |
-| **Real timeouts** | The process is killed when the timeout passes (default 30 s, max 180 s). |
+| **Real timeouts** | The run is killed when the timeout passes (default 30 s, max 180 s). |
+| **Process-tree kill** | Each run is the root of its own process tree (a new session/process group on POSIX, a job object on Windows). When the run ends, finished or timed out, everything it started is killed too, so background processes cannot outlive it or hold its output open. |
+| **Resource limits** | Memory, file-size and process limits set by the [trust tier](#trust-tiers). |
 | **Scrubbed environment** | The child does **not** inherit the server's environment. It gets only what Python needs to start: `PATH`, locale (`LANG`, `LC_*`, `TZ`), `HOME`/`TMPDIR` on POSIX, and `SYSTEMROOT`, `SYSTEMDRIVE`, `WINDIR`, `COMSPEC`, `PATHEXT`, `TEMP`/`TMP`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`/`LOCALAPPDATA`, `PROGRAMDATA`, `PROCESSOR_ARCHITECTURE`, `NUMBER_OF_PROCESSORS` on Windows, plus `PYTHONIOENCODING=utf-8` and `PYTHONDONTWRITEBYTECODE=1`. API keys, tokens, proxy settings and `SKILL_ORCHESTRATOR_*` settings are not passed. Processes the skill starts inherit the same scrubbed environment. |
 | **Operator-only passthrough** | `SKILL_ORCHESTRATOR_ENV_PASSTHROUGH=NAME1,NAME2` copies those named variables from the server's environment. It is read from the server's own environment, so an MCP client cannot set it; tool arguments (`context`, `parameters`) become Python variables, never environment variables. Only pass what skills must have, and remember any skill can then read it. `get_orchestrator_status` lists the names (never values). |
 | **State writes** | Skills reach persistent state only through the state bridge (validated namespaces, committed only on success). |
@@ -869,17 +875,62 @@ Treat the server as having the permissions of that user.
   credential files such as `~/.aws/credentials` or `~/.netrc`. The scrubbed
   environment only removes secrets that live in environment variables.
 - **Network:** unrestricted outbound access.
-- **Resources:** no memory, CPU or process-count limits beyond the timeout.
-- **Other processes:** no namespaces, seccomp, or containers. A skill can
-  start background processes that outlive the timeout.
+- **Limits are guard rails, not a boundary:** they stop runaway or buggy
+  code. Code that sets out to escape can, because it runs as the server's
+  user: on POSIX a process can leave its process group with `setsid()`
+  (the restricted tier blocks new processes, which closes this), and on
+  Windows a same-user process can open and change its job object. There is
+  no CPU limit beyond the wall-clock timeout, and no disk-quota limit.
+- **Other processes:** no namespaces, seccomp, or containers.
 - **In-process mode:** `SKILL_ORCHESTRATOR_EXEC_MODE=inprocess` runs code
   inside the server with full access to its memory and environment (no
-  scrub, no timeout). Do not use it with untrusted code.
+  scrub, no timeout, no limits). Do not use it with untrusted code. The
+  restricted tier ignores it.
 - **Verification side effects:** test cases run the real code, so a skill
   that writes files or calls an API does so while being verified.
 
 For untrusted code, run the whole server inside a container or VM with no
 credentials mounted and a network egress allowlist.
+
+### Trust tiers
+
+The operator picks how much the server trusts the code it runs with
+`SKILL_ORCHESTRATOR_TRUST_TIER`. Like the env passthrough, it is read from the
+server's own environment on every run; no tool call can change it.
+
+| | `trusted` | `standard` (default) | `restricted` |
+|---|---|---|---|
+| Memory | no limit | 4096 MB | 1024 MB |
+| Largest file written | no limit | 1024 MB | 64 MB |
+| Starting processes | allowed | allowed | blocked |
+| Process-tree kill | yes | yes | yes |
+| `execute_code`, `create_skill`, `update_skill`, `import_skill`, `rollback_skill`, `delete_skill` | allowed | allowed | refused |
+| Which skills run | all (drafts warn) | all (drafts warn) | `verified` only, including nested calls |
+| Env passthrough | honored | honored | ignored |
+| In-process mode | honored | honored | ignored (always a subprocess) |
+| A limit that can't be enforced | warning in the output | warning in the output | run refused |
+
+Use `restricted` to serve a vetted skill library: author and verify skills
+under `standard`, then switch. `verify_skill` stays available, so a saved
+skill with test cases can be verified in place. An unknown tier value
+(e.g. a typo) is treated as `restricted`, and `get_orchestrator_status`
+says so.
+
+The three limit variables override a tier's limits one at a time; they
+never change its tool policy. How each limit is enforced:
+
+| Limit | Linux / macOS | Windows |
+|---|---|---|
+| Memory | `RLIMIT_AS`, per process | Job object, committed memory of the whole tree |
+| File size | `RLIMIT_FSIZE`, per file | Not enforced |
+| No processes | `RLIMIT_NPROC=0`. On Linux this also blocks new threads. Not enforced for root: run as another user, or set `SKILL_ORCHESTRATOR_ALLOW_SUBPROCESSES=on` to accept that | Job object active-process limit of 1 |
+
+POSIX limits are set by the runner before any skill code runs, with hard
+limits lowered so the code cannot raise them again. On Windows the runner
+waits until it is inside its job object before running any code. A
+memory-limit hit surfaces as a normal `MemoryError` in the run's output.
+CI covers Linux and Windows; macOS uses the same POSIX calls but is not
+tested.
 
 ### No package installation
 
@@ -917,6 +968,7 @@ is ever added it must stay off by default.
 - [x] Verified-save gate: test cases run before a skill is saved (Implemented!)
 - [x] Scrubbed environment for skill processes (Implemented!)
 - [x] SKILL.md (agentskills.io) export and import (Implemented!)
+- [x] Operator trust tiers, process-tree kill and resource limits (Implemented!)
 - [ ] Filesystem and network isolation for skill processes
 
 ---
