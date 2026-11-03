@@ -30,6 +30,8 @@ os.environ.pop("SKILL_ORCHESTRATOR_EXEC_MODE", None)
 from skill_orchestrator_mcp import server  # noqa: E402  (must follow HOME redirect)
 from skill_orchestrator_mcp.artifacts import ArtifactStore  # noqa: E402
 from skill_orchestrator_mcp.skill_index import SkillIndex  # noqa: E402
+from skill_orchestrator_mcp.skill_versions import SkillVersionStore  # noqa: E402
+from skill_orchestrator_mcp.telemetry import ExecutionTelemetry  # noqa: E402
 from skill_orchestrator_mcp.usage_stats import UsageTracker  # noqa: E402
 
 
@@ -44,6 +46,7 @@ class Storage:
     state_dir: Path
     sessions_dir: Path
     artifacts_dir: Path
+    telemetry_dir: Path
 
 
 @pytest.fixture
@@ -56,8 +59,9 @@ def storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Storage
         state_dir=root / "state",
         sessions_dir=root / "sessions",
         artifacts_dir=root / "artifacts",
+        telemetry_dir=root / "telemetry",
     )
-    for d in (s.skills_dir, s.state_dir, s.sessions_dir, s.artifacts_dir):
+    for d in (s.skills_dir, s.state_dir, s.sessions_dir, s.artifacts_dir, s.telemetry_dir):
         d.mkdir(parents=True)
 
     monkeypatch.setattr(server, "DEFAULT_SKILLS_DIR", s.skills_dir)
@@ -67,6 +71,10 @@ def storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Storage
     monkeypatch.setattr(server, "SKILL_INDEX", SkillIndex(s.skills_dir))
     monkeypatch.setattr(server, "USAGE_TRACKER", UsageTracker(s.skills_dir))
     monkeypatch.setattr(server, "ARTIFACT_STORE", ArtifactStore(s.artifacts_dir))
+    monkeypatch.setattr(server, "DEFAULT_TELEMETRY_DIR", s.telemetry_dir)
+    monkeypatch.setattr(server, "TELEMETRY", ExecutionTelemetry(s.telemetry_dir))
+    monkeypatch.setattr(server, "SKILL_VERSIONS", SkillVersionStore(s.skills_dir))
+    monkeypatch.delenv("SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT", raising=False)
     # Force search_skills to re-check the directory on its next call.
     monkeypatch.setattr(server, "_last_index_refresh_check_monotonic", 0.0)
     yield s

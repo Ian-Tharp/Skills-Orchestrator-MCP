@@ -8,13 +8,13 @@ This reduces write amplification and keeps skill metadata stable for indexing.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
+
+from . import fileio
 
 DEFAULT_FLUSH_INTERVAL_SECONDS = 10.0
 DEFAULT_MAX_UPDATES_BEFORE_FLUSH = 25
@@ -22,20 +22,7 @@ DEFAULT_USAGE_FILENAME = ".skill_usage.json"  # dotfile so it won't match "*.jso
 
 
 def _atomic_write_json(path: Path, data: Dict[str, int]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-        dir=str(path.parent),
-        prefix=path.name + ".",
-        suffix=".tmp",
-    ) as tmp:
-        json.dump(data, tmp, indent=2)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
-    os.replace(tmp_path, path)
+    fileio.atomic_write_json(path, data)
 
 
 @dataclass
