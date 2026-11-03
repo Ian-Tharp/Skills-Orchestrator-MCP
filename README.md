@@ -340,8 +340,10 @@ How writes behave:
   the current file under a cross-process file lock, so keys the skill didn't
   touch (for example, written meanwhile by another agent or another server
   process) are preserved. Last writer wins per key.
-- `sys.exit(0)` ends a run cleanly (writes are committed); any other exit
-  code, an exception or a timeout discards them.
+- `sys.exit(0)` in the top-level skill ends the run cleanly (writes are
+  committed); any other exit code, an exception or a timeout discards them.
+  In a nested skill, `sys.exit()` ends only that child: the caller gets a
+  `RuntimeError` it can catch, and the child's writes are rolled back.
 - Values must be strict JSON (checked at `set_state` time; `NaN` and
   `Infinity` are rejected). Namespaces follow the same rules as the tools (no
   path separators, no leading dot).
@@ -384,8 +386,8 @@ An update that changes nothing does not create a version.
   this with `SKILL_ORCHESTRATOR_DEPENDENCY_ENFORCEMENT` (`strict`, `warn`,
   `off`).
 - **`parameters_schema`** must be a valid JSON Schema for an object (the draft
-  is taken from `$schema`, default 2020-12; only local `$ref`s like
-  `#/$defs/name` are allowed). Every invocation is validated against it before
+  is taken from `$schema`, default 2020-12; every `$ref` must resolve inside
+  the schema, since remote references are never fetched). Every invocation is validated against it before
   the skill runs, and top-level `default` values are filled in. Control this with
   `SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT` (`strict`, `warn`, `off`). Legacy
   skills whose stored schema is invalid run with a warning.

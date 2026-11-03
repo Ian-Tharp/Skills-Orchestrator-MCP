@@ -63,12 +63,28 @@ A bug-hunt review reproduced the following problems; each is fixed and covered b
 - **Telemetry:** "last run" and recent-run order use timestamps, not file order, since nested records are written when the parent finishes. `record()` never raises, and `|` in errors no longer breaks the markdown tables.
 - **Performance:** dependency, schema and skill-reference checks are cached, and the registry is built off the event loop. With 200 skills, building the registry takes about 6 ms (it took about 144 ms before the fix, and about 5 ms before this change).
 
+A second review of those fixes found and fixed:
+
+- **Lock waits blocked the event loop.** Tools that take a file lock now do that work in a worker thread, so a lock held by another process no longer freezes every other request. Thread and file waits share one deadline. On file systems without lock support, locking falls back to in-process only, with a warning, instead of timing out every write.
+- **Nested `sys.exit(0)`** committed a cut-off parent as `ok`. A `SystemExit` in a child now becomes a `RuntimeError` for the caller. A child whose exception can't be converted to a string is still rolled back.
+- **Composition helpers:** only the state bridge is pinned to the runner's helpers. A parent that wraps `invoke_skill` (for example to trace its subtree) applies to grandchildren again, as before. In `warn` mode, non-dict nested parameters pass through with a warning.
+- **Contracts:**
+  - `$ref`s are resolved with `referencing` (the library jsonschema uses), so `"$ref"` keys inside `default`/`examples`, a property named `$ref`, anchors, `$id`-relative and percent-encoded refs are all accepted, and remote refs are reported as unresolvable.
+  - A non-string `$schema` is rejected cleanly.
+  - Dotted dependency names check the submodule itself, still without importing.
+  - A bare-string dependency is displayed and checked as one requirement.
+- **Edge cases:**
+  - An infinite `version` is tolerated.
+  - `create_skill` won't overwrite an existing empty or corrupt skill file.
+  - Temp files are cleaned up on every failed replace.
+  - Telemetry `clear()` is best effort and only rewrites the log when it removes something.
+
 ## Behavior changes
 
 - `delete_skill` on a skill that other skills call needs `force=True`.
 - `invoke_skill` refuses skills with unmet dependencies or invalid parameters (in `strict` mode) instead of running them.
 - The `invoke_skill` header now includes the version: `## Skill Execution: name (v3)`.
-- `sys.exit(0)` inside a skill is now a clean finish (its state writes commit). Before, the run ended without a result.
+- `sys.exit(0)` in a top-level skill is now a clean finish (its state writes commit). Before, the run ended without a result. In a nested skill it raises `RuntimeError` in the caller.
 
 ## Not covered
 

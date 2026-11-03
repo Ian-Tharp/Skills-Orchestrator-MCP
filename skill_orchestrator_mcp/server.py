@@ -271,16 +271,24 @@ def _write_temp_json(path: Path, data: Any) -> Path:
 
 
 def _replace_file(tmp_path: Path, path: Path) -> None:
-    """os.replace with a short retry: on Windows the target may be briefly open elsewhere."""
+    """os.replace with a short retry: on Windows the target may be briefly open elsewhere.
+
+    On final failure the temp file is removed, so failed writes never leave
+    `.tmp` files behind.
+    """
     for attempt in range(5):
         try:
             os.replace(tmp_path, path)
             return
         except PermissionError:
-            if attempt == 4:
-                tmp_path.unlink(missing_ok=True)
-                raise
-            time.sleep(0.05 * (attempt + 1))
+            if attempt < 4:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            tmp_path.unlink(missing_ok=True)
+            raise
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -293,7 +301,7 @@ def _skill_version(skill: Dict[str, Any]) -> int:
     raw = skill.get("version", 1)
     try:
         v = int(float(raw))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 1
     return v if v >= 1 else 1
 
@@ -488,7 +496,7 @@ def _skill_dependents(name: str) -> List[str]:
     return sorted(dependents)
 
 
-def _contract_warnings(name: str, code: str, dependencies: List[str]) -> List[str]:
+def _contract_warnings(name: str, code: str, dependencies: Any) -> List[str]:
     """Non-fatal problems worth telling the author about at create/update time."""
     warnings: List[str] = []
     report = contracts.check_dependencies(dependencies)
@@ -508,6 +516,14 @@ def _contract_warnings(name: str, code: str, dependencies: List[str]) -> List[st
     return warnings
 
 
+def _clear_telemetry(name: str) -> None:
+    """Drop a skill's telemetry; best effort, never fails the calling tool."""
+    try:
+        TELEMETRY.clear(name)
+    except Exception:
+        pass
+
+
 def _format_warnings(warnings: List[str]) -> str:
     if not warnings:
         return ""
@@ -517,6 +533,81 @@ def _format_warnings(warnings: List[str]) -> str:
 # =============================================================================
 # Core Tools
 # =============================================================================
+
+def _create_skill_locked(params: CreateSkillInput) -> str:
+    """Body of `create_skill`; runs in a worker thread (it may wait on a file lock)."""
+    with _skills_lock():
+        # Check if skill already exists
+        try:
+            existing = _load_skill(params.name)
+        except (OSError, ValueError):
+            existing = {}
+        # Any existing file counts, even an empty or corrupt one: never overwrite it
+        # (and its history) from create_skill.
+        if existing is not None or _get_skill_path(params.name).exists():
+            if not isinstance(existing, dict) or not existing:
+                return (
+                    f"Error: A skill file for '{params.name}' already exists but is empty or "
+                    "unreadable. Fix or delete it before creating the skill again."
+                )
+            return (
+                f"Error: Skill '{params.name}' already exists (ID: {existing.get('id', 'unknown')}). "
+                "Use update_skill to modify."
+            )
+
+        # Create skill metadata
+        skill_data = {
+            "id": _generate_skill_id(params.name),
+            "name": params.name,
+            "description": params.description,
+            "code": params.code,
+            "category": params.category.value,
+            "tags": params.tags,
+            "dependencies": params.dependencies,
+            "parameters_schema": params.parameters_schema,
+            "examples": params.examples,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "version": 1,
+            "invocation_count": 0
+        }
+
+        # Validate code syntax
+        try:
+            compile(params.code, f"skill_{params.name}", 'exec')
+        except SyntaxError as e:
+            return f"Error: Invalid Python syntax in skill code: {e}"
+
+        # Validate contracts (bad schemas / requirement strings are author errors, reject them).
+        schema_error = contracts.check_schema(params.parameters_schema)
+        if schema_error:
+            return f"Error: {schema_error}"
+        dep_errors = contracts.invalid_dependencies(params.dependencies)
+        if dep_errors:
+            return "Error: " + "; ".join(dep_errors)
+        warnings = _contract_warnings(params.name, params.code, params.dependencies)
+
+        # A skill file removed outside the tools can leave history and
+        # telemetry behind; a new skill with the same name must start clean.
+        SKILL_VERSIONS.remove_all(params.name)
+        _clear_telemetry(params.name)
+
+        # Save skill
+        _save_skill(skill_data)
+        SKILL_INDEX.upsert_from_skill(skill_data)
+        SKILL_VERSIONS.save(params.name, skill_data)
+        USAGE_TRACKER.ensure_minimums({params.name: 0})
+
+        return f"""✅ Skill created successfully!
+
+**Name:** {params.name}
+**ID:** {skill_data['id']}
+**Category:** {params.category.value}
+**Tags:** {', '.join(params.tags) if params.tags else 'None'}
+**Dependencies:** {', '.join(params.dependencies) if params.dependencies else 'None'}
+
+The skill is now available for invocation via `invoke_skill`.{_format_warnings(warnings)}"""
+
 
 @mcp.tool(
     name="create_skill",
@@ -554,64 +645,7 @@ async def create_skill(params: CreateSkillInput) -> str:
     Returns:
         str: Confirmation message with skill ID
     """
-    with _skills_lock():
-        # Check if skill already exists
-        existing = _load_skill(params.name)
-        if existing:
-            return f"Error: Skill '{params.name}' already exists (ID: {existing['id']}). Use update_skill to modify."
-
-        # Create skill metadata
-        skill_data = {
-            "id": _generate_skill_id(params.name),
-            "name": params.name,
-            "description": params.description,
-            "code": params.code,
-            "category": params.category.value,
-            "tags": params.tags,
-            "dependencies": params.dependencies,
-            "parameters_schema": params.parameters_schema,
-            "examples": params.examples,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "version": 1,
-            "invocation_count": 0
-        }
-
-        # Validate code syntax
-        try:
-            compile(params.code, f"skill_{params.name}", 'exec')
-        except SyntaxError as e:
-            return f"Error: Invalid Python syntax in skill code: {e}"
-
-        # Validate contracts (bad schemas / requirement strings are author errors, reject them).
-        schema_error = contracts.check_schema(params.parameters_schema)
-        if schema_error:
-            return f"Error: {schema_error}"
-        dep_errors = contracts.invalid_dependencies(params.dependencies)
-        if dep_errors:
-            return "Error: " + "; ".join(dep_errors)
-        warnings = _contract_warnings(params.name, params.code, params.dependencies)
-
-        # A skill file removed outside the tools can leave history and
-        # telemetry behind; a new skill with the same name must start clean.
-        SKILL_VERSIONS.remove_all(params.name)
-        TELEMETRY.clear(params.name)
-
-        # Save skill
-        _save_skill(skill_data)
-        SKILL_INDEX.upsert_from_skill(skill_data)
-        SKILL_VERSIONS.save(params.name, skill_data)
-        USAGE_TRACKER.ensure_minimums({params.name: 0})
-
-        return f"""✅ Skill created successfully!
-
-**Name:** {params.name}
-**ID:** {skill_data['id']}
-**Category:** {params.category.value}
-**Tags:** {', '.join(params.tags) if params.tags else 'None'}
-**Dependencies:** {', '.join(params.dependencies) if params.dependencies else 'None'}
-
-The skill is now available for invocation via `invoke_skill`.{_format_warnings(warnings)}"""
+    return await asyncio.to_thread(_create_skill_locked, params)
 
 
 @mcp.tool(
@@ -651,8 +685,9 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
     version = _skill_version(skill)
     warnings: List[str] = []
 
-    def _reject(reason: str) -> str:
-        TELEMETRY.record(
+    async def _reject(reason: str) -> str:
+        await asyncio.to_thread(
+            TELEMETRY.record,
             kind=KIND_SKILL,
             status=STATUS_REJECTED,
             duration_ms=0.0,
@@ -668,7 +703,7 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
         report = contracts.check_dependencies(skill.get('dependencies'))
         warnings.extend(f"Dependency ignored: {d}" for d in report.invalid)
         if report.missing and dep_mode == contracts.ENFORCE_STRICT:
-            return _reject(
+            return await _reject(
                 f"Skill '{params.skill_name}' has unmet dependencies: {', '.join(report.missing)}. "
                 f"{contracts.install_hint(report.missing)}"
             )
@@ -691,7 +726,7 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
             warnings.append(f"Parameters not validated: {schema_error}. Fix it with update_skill.")
         else:
             if errors and mode == contracts.ENFORCE_STRICT:
-                return _reject(
+                return await _reject(
                     f"Invalid parameters for skill '{params.skill_name}':\n"
                     + "\n".join(f"- {e}" for e in errors)
                     + "\nUse get_skill to see its parameters_schema."
@@ -716,7 +751,9 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
         enable_composition=True,
         current_skill_name=params.skill_name
     )
-    _record_outcome(outcome, kind=KIND_SKILL, skill_name=params.skill_name, skill_version=version)
+    await asyncio.to_thread(
+        _record_outcome, outcome, kind=KIND_SKILL, skill_name=params.skill_name, skill_version=version
+    )
 
     # Update invocation count without rewriting the skill JSON (write amplification).
     USAGE_TRACKER.increment(params.skill_name)
@@ -790,7 +827,7 @@ async def execute_code(params: ExecuteCodeInput) -> str:
         timeout=params.timeout,
         capture_output=params.capture_output
     )
-    _record_outcome(outcome, kind=KIND_CODE)
+    await asyncio.to_thread(_record_outcome, outcome, kind=KIND_CODE)
     output = outcome.text
 
     ref = ARTIFACT_STORE.put_text(
@@ -1303,10 +1340,13 @@ def _check_skill_params(skill_name, skill, parameters):
             or not skill.get('schema_valid', True)):
         return params
     if not isinstance(params, dict):
-        raise ValueError(
-            f"Invalid parameters for skill '{skill_name}': expected a dict, "
-            f"got {type(params).__name__}"
-        )
+        msg = (f"Invalid parameters for skill '{skill_name}': expected a dict, "
+               f"got {type(params).__name__}")
+        if mode == 'strict':
+            raise ValueError(msg)
+        import sys as _sys
+        print(f"[warning] {msg}", file=_sys.stderr)
+        return params
     props = schema.get('properties') if isinstance(schema, dict) else None
     if isinstance(props, dict):
         missing_defaults = {
@@ -1454,9 +1494,17 @@ def invoke_skill(skill_name, parameters=None, context=None):
             '_skill_call_stack': skill_call_stack,
             '_max_skill_call_depth': max_call_depth,
         }
-        # Use the helper references captured by the runner, not whatever the
-        # calling skill's globals hold now: a skill that defines its own
-        # set_state/pretty_print must not hijack its children's helpers.
+        # Composition/debug helpers follow the caller's globals (a skill may
+        # wrap invoke_skill to trace its subtree, as before). The state bridge
+        # always uses the runner's real helpers: a skill that defines its own
+        # set_state for local use must not silently swallow its children's writes.
+        child_namespace.update({
+            'invoke_skill': invoke_skill,
+            'list_available_skills': list_available_skills,
+            'get_skill_info': get_skill_info,
+            'debug_context': debug_context,
+            'pretty_print': pretty_print,
+        })
         child_namespace.update(g.get('_helper_refs') or {})
 
         # Execute the skill code
@@ -1467,11 +1515,21 @@ def invoke_skill(skill_name, parameters=None, context=None):
 
     except BaseException as e:
         status = 'error'
-        error = f"{type(e).__name__}: {e}"
-        # Roll back this call's state writes so a caller that catches the
-        # exception doesn't commit a half-finished child's changes.
+        # Roll back this call's state writes first (building the message can
+        # itself fail), so a caller that catches the exception doesn't commit
+        # a half-finished child's changes.
         del g['_state_ops'][state_mark:]
         g['_state_cache'].clear()
+        try:
+            error = f"{type(e).__name__}: {e}"
+        except Exception:
+            error = type(e).__name__
+        if isinstance(e, SystemExit):
+            # sys.exit() in a child ends the child, not the whole run: surface it
+            # to the caller as an ordinary exception it can handle.
+            raise RuntimeError(
+                f"Skill '{skill_name}' called sys.exit({e.code!r})"
+            ) from None
         raise
 
     finally:
@@ -1587,11 +1645,7 @@ def main():
         exec(helpers, namespace)
         namespace["_helper_refs"] = {
             name: namespace[name]
-            for name in (
-                "invoke_skill", "list_available_skills", "get_skill_info",
-                "debug_context", "pretty_print",
-                "get_state", "set_state", "delete_state", "list_state_keys",
-            )
+            for name in ("get_state", "set_state", "delete_state", "list_state_keys")
         }
 
         # Execute the actual code
@@ -1605,8 +1659,11 @@ def main():
         # sys.exit()/exit() inside a skill: 0/None means "done", anything else is a failure.
         result = namespace.get("__result__")
         if e.code not in (0, None):
-            exit_code = e.code
-            error = f"Process exited with exit code {e.code} (sys.exit)"
+            exit_code = e.code if isinstance(e.code, int) else 1
+            if isinstance(e.code, int):
+                error = f"Process exited with exit code {e.code} (sys.exit)"
+            else:
+                error = f"sys.exit({e.code!r})"
             error_type = "SystemExit"
     except BaseException as e:
         # str(e) is empty for e.g. a bare `assert` or `raise RuntimeError()`;
@@ -1822,7 +1879,7 @@ async def _run_code(
                     )
             elif state_ops:
                 try:
-                    counts = _commit_state_ops(state_ops)
+                    counts = await asyncio.to_thread(_commit_state_ops, state_ops)
                 except StateCommitError as e:
                     error = str(e)
                     error_type = "StateCommitError"
@@ -1872,7 +1929,9 @@ async def _run_code(
                 error_summary: Optional[str] = f"Timed out after {timeout}s"
             elif error is not None:
                 status = STATUS_ERROR
-                error_summary = f"{error_type}: {error}" if error_type else str(error)
+                error_summary = (
+                    f"{error_type}: {error}" if error_type and error != error_type else str(error)
+                )
             else:
                 status = STATUS_OK
                 error_summary = None
@@ -2016,7 +2075,7 @@ async def search_skills(params: SearchSkillsInput) -> str:
         lines.append(f"*{skill.get('description') or 'No description'}*\n")
         lines.append(f"- **Category:** {skill.get('category', 'custom')}")
         lines.append(f"- **Tags:** {', '.join(skill.get('tags', [])) or 'None'}")
-        lines.append(f"- **Dependencies:** {', '.join(skill.get('dependencies', [])) or 'None'}")
+        lines.append(f"- **Dependencies:** {contracts.format_dependencies(skill.get('dependencies'))}")
         lines.append(f"- **Used:** {skill.get('invocation_count', 0)} times")
         lines.append(f"- **ID:** {skill.get('id', 'unknown')}")
 
@@ -2087,7 +2146,7 @@ async def get_skill(name: str, version: Optional[int] = None) -> str:
         f"- **Version:** {shown_version}"
         + ("" if is_current else f" (current is v{current_version})"),
         f"- **Tags:** {', '.join(skill.get('tags', [])) or 'None'}",
-        f"- **Dependencies:** {', '.join(skill.get('dependencies', [])) or 'None'}",
+        f"- **Dependencies:** {contracts.format_dependencies(skill.get('dependencies'))}",
         f"- **Created:** {skill.get('created_at', 'unknown')}",
         f"- **Updated:** {skill.get('updated_at', 'unknown')}",
         f"- **Invocations:** {skill.get('invocation_count', 0)}",
@@ -2125,17 +2184,7 @@ async def get_skill(name: str, version: Optional[int] = None) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(
-    name="update_skill",
-    annotations=ToolAnnotations(
-        title="Update an Existing Skill",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False
-    )
-)
-async def update_skill(
+def _update_skill_locked(
     name: str,
     code: Optional[str] = None,
     description: Optional[str] = None,
@@ -2147,31 +2196,7 @@ async def update_skill(
     expected_version: Optional[int] = None,
     change_note: Optional[str] = None,
 ) -> str:
-    """Update an existing skill's properties.
-
-    Only provided fields will be updated; others remain unchanged. Each
-    update saves a new version and keeps the previous ones, so a bad edit can
-    be undone with `rollback_skill`. Compare versions with
-    `diff_skill_versions` and check error rates per version with
-    `get_skill_stats`.
-
-    Args:
-        name: Name of the skill to update
-        code: New Python code (optional)
-        description: New description (optional)
-        tags: New tags list (optional)
-        dependencies: New Python requirement strings, e.g. ["pandas>=2"] (optional)
-        parameters_schema: New JSON Schema for params (optional; pass {} to remove it)
-        category: New category (optional, see list_categories)
-        examples: New example usage strings (optional)
-        expected_version: If set, the update is refused unless the skill is
-            currently at this version (guards against overwriting a
-            concurrent edit by another agent)
-        change_note: Short note on why the skill changed, kept with the version
-
-    Returns:
-        str: Confirmation of update
-    """
+    """Body of `update_skill`; runs in a worker thread (it may wait on a file lock)."""
     with _skills_lock():
         skill = _load_skill(name)
         if not skill:
@@ -2244,7 +2269,7 @@ async def update_skill(
         SKILL_VERSIONS.save(name, updated)
 
         warnings = _contract_warnings(
-            name, str(updated.get('code', '')), list(updated.get('dependencies') or [])
+            name, str(updated.get('code', '')), updated.get('dependencies')
         )
         undo = (
             f" Undo with rollback_skill(name='{name}', version={current_version})."
@@ -2255,6 +2280,87 @@ async def update_skill(
             f"✅ Skill '{name}' updated to version {updated['version']}.{undo}"
             f"{_format_warnings(warnings)}"
         )
+
+
+@mcp.tool(
+    name="update_skill",
+    annotations=ToolAnnotations(
+        title="Update an Existing Skill",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False
+    )
+)
+async def update_skill(
+    name: str,
+    code: Optional[str] = None,
+    description: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    dependencies: Optional[List[str]] = None,
+    parameters_schema: Optional[Dict[str, Any]] = None,
+    category: Optional[str] = None,
+    examples: Optional[List[str]] = None,
+    expected_version: Optional[int] = None,
+    change_note: Optional[str] = None,
+) -> str:
+    """Update an existing skill's properties.
+
+    Only provided fields will be updated; others remain unchanged. Each
+    update saves a new version and keeps the previous ones, so a bad edit can
+    be undone with `rollback_skill`. Compare versions with
+    `diff_skill_versions` and check error rates per version with
+    `get_skill_stats`.
+
+    Args:
+        name: Name of the skill to update
+        code: New Python code (optional)
+        description: New description (optional)
+        tags: New tags list (optional)
+        dependencies: New Python requirement strings, e.g. ["pandas>=2"] (optional)
+        parameters_schema: New JSON Schema for params (optional; pass {} to remove it)
+        category: New category (optional, see list_categories)
+        examples: New example usage strings (optional)
+        expected_version: If set, the update is refused unless the skill is
+            currently at this version (guards against overwriting a
+            concurrent edit by another agent)
+        change_note: Short note on why the skill changed, kept with the version
+
+    Returns:
+        str: Confirmation of update
+    """
+    return await asyncio.to_thread(_update_skill_locked, name, code, description, tags, dependencies, parameters_schema, category, examples, expected_version, change_note)
+
+
+def _delete_skill_locked(name: str, confirm: bool = False, force: bool = False) -> str:
+    """Body of `delete_skill`; runs in a worker thread (it may wait on a file lock)."""
+    with _skills_lock():
+        if not confirm:
+            return f"⚠️ To delete skill '{name}', call delete_skill with confirm=True"
+
+        if not _is_safe_storage_name(name):
+            return f"Error: Invalid skill name '{name}'."
+
+        path = _get_skill_path(name)
+        if not path.exists():
+            return f"Error: Skill '{name}' not found."
+
+        dependents = _skill_dependents(name)
+        if dependents and not force:
+            return (
+                f"Error: Skill '{name}' is called by: {', '.join(dependents)}. Deleting it would "
+                "break them. Update those skills first, or pass force=True to delete anyway."
+            )
+
+        path.unlink()
+        SKILL_INDEX.remove(name)
+        USAGE_TRACKER.remove(name)
+        SKILL_VERSIONS.remove_all(name)
+        _clear_telemetry(name)
+        msg = f"✅ Skill '{name}' has been permanently deleted."
+        if dependents:
+            msg += f"\n\n**Warning:** these skills still call it and will fail: {', '.join(dependents)}"
+        return msg
 
 
 @mcp.tool(
@@ -2282,33 +2388,7 @@ async def delete_skill(name: str, confirm: bool = False, force: bool = False) ->
     Returns:
         str: Confirmation or error message
     """
-    with _skills_lock():
-        if not confirm:
-            return f"⚠️ To delete skill '{name}', call delete_skill with confirm=True"
-
-        if not _is_safe_storage_name(name):
-            return f"Error: Invalid skill name '{name}'."
-
-        path = _get_skill_path(name)
-        if not path.exists():
-            return f"Error: Skill '{name}' not found."
-
-        dependents = _skill_dependents(name)
-        if dependents and not force:
-            return (
-                f"Error: Skill '{name}' is called by: {', '.join(dependents)}. Deleting it would "
-                "break them. Update those skills first, or pass force=True to delete anyway."
-            )
-
-        path.unlink()
-        SKILL_INDEX.remove(name)
-        USAGE_TRACKER.remove(name)
-        SKILL_VERSIONS.remove_all(name)
-        TELEMETRY.clear(name)
-        msg = f"✅ Skill '{name}' has been permanently deleted."
-        if dependents:
-            msg += f"\n\n**Warning:** these skills still call it and will fail: {', '.join(dependents)}"
-        return msg
+    return await asyncio.to_thread(_delete_skill_locked, name, confirm, force)
 
 
 # =============================================================================
@@ -2442,31 +2522,8 @@ async def diff_skill_versions(
     return f"## {name}: v{from_version} → v{target}\n\n{body}"
 
 
-@mcp.tool(
-    name="rollback_skill",
-    annotations=ToolAnnotations(
-        title="Roll a Skill Back to an Earlier Version",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False
-    )
-)
-async def rollback_skill(name: str, version: int, expected_version: Optional[int] = None) -> str:
-    """Restore a skill's content from an earlier version.
-
-    Non-destructive: the restored content is saved as a new version
-    (rolling back from v5 to v2 creates v6 = v2's content), so the rollback
-    itself can be undone.
-
-    Args:
-        name: Skill name
-        version: Version to restore (see list_skill_versions)
-        expected_version: If set, refuse unless the skill is currently at this version
-
-    Returns:
-        str: Confirmation with the new version number
-    """
+def _rollback_skill_locked(name: str, version: int, expected_version: Optional[int] = None) -> str:
+    """Body of `rollback_skill`; runs in a worker thread (it may wait on a file lock)."""
     with _skills_lock():
         skill = _load_skill(name)
         if not skill:
@@ -2505,6 +2562,34 @@ async def rollback_skill(name: str, version: int, expected_version: Optional[int
             f"✅ Skill '{name}' rolled back to the content of v{version}, saved as "
             f"version {restored['version']}."
         )
+
+
+@mcp.tool(
+    name="rollback_skill",
+    annotations=ToolAnnotations(
+        title="Roll a Skill Back to an Earlier Version",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False
+    )
+)
+async def rollback_skill(name: str, version: int, expected_version: Optional[int] = None) -> str:
+    """Restore a skill's content from an earlier version.
+
+    Non-destructive: the restored content is saved as a new version
+    (rolling back from v5 to v2 creates v6 = v2's content), so the rollback
+    itself can be undone.
+
+    Args:
+        name: Skill name
+        version: Version to restore (see list_skill_versions)
+        expected_version: If set, refuse unless the skill is currently at this version
+
+    Returns:
+        str: Confirmation with the new version number
+    """
+    return await asyncio.to_thread(_rollback_skill_locked, name, version, expected_version)
 
 
 # =============================================================================
@@ -2675,14 +2760,20 @@ async def set_state(params: StateInput) -> str:
     if not _is_safe_storage_name(params.namespace):
         return _invalid_namespace_message(params.namespace)
 
-    with _state_lock():
-        state = _load_state(params.namespace)
-        try:
-            _set_nested_value(state, params.key, params.value)
-        except ValueError as e:
-            return f"Error: {e}"
-        _save_state(params.namespace, state)
+    def _locked() -> Optional[str]:
+        with _state_lock():
+            state = _load_state(params.namespace)
+            try:
+                _set_nested_value(state, params.key, params.value)
+            except ValueError as e:
+                return f"Error: {e}"
+            _save_state(params.namespace, state)
+        return None
 
+    # Off the event loop: the lock may be held by another server process.
+    error = await asyncio.to_thread(_locked)
+    if error:
+        return error
     return f"✅ State '{params.key}' set in namespace '{params.namespace}'."
 
 
@@ -2709,12 +2800,15 @@ async def delete_state(key: str, namespace: str = "default") -> str:
     if not _is_safe_storage_name(namespace):
         return _invalid_namespace_message(namespace)
 
-    with _state_lock():
-        state = _load_state(namespace)
-        existed = _delete_nested_value(state, key)
-        if existed:
-            _save_state(namespace, state)
+    def _locked() -> bool:
+        with _state_lock():
+            state = _load_state(namespace)
+            found = _delete_nested_value(state, key)
+            if found:
+                _save_state(namespace, state)
+            return found
 
+    existed = await asyncio.to_thread(_locked)
     if not existed:
         return f"State '{key}' not found in namespace '{namespace}'."
     return f"✅ State '{key}' deleted from namespace '{namespace}'."

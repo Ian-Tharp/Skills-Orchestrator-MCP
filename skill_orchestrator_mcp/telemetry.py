@@ -22,6 +22,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -210,14 +211,18 @@ class ExecutionTelemetry:
 
     def clear(self, skill_name: Optional[str] = None) -> int:
         """Drop records (all, or for one skill). Returns the number removed."""
+        if not self._path.exists():
+            return 0
         with self._lock, file_lock(self._file_lock_path):
             records = self._read_locked()
             if skill_name is None:
                 kept: List[Dict[str, Any]] = []
             else:
                 kept = [r for r in records if r.get("skill") != skill_name]
-            self._rewrite_locked(kept)
-            return len(records) - len(kept)
+            removed = len(records) - len(kept)
+            if removed:
+                self._rewrite_locked(kept)
+            return removed
 
     # ------------------------------------------------------------------- read
 
@@ -247,8 +252,9 @@ class ExecutionTelemetry:
         if limit <= 0:
             return []
         recs = self.records(skill_name=skill_name)
-        recs.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
-        return recs[:limit]
+        # Ties (coarse clocks, e.g. on Windows) fall back to file order: later line = newer.
+        order = sorted(range(len(recs)), key=lambda i: (str(recs[i].get("ts") or ""), i), reverse=True)
+        return [recs[i] for i in order[:limit]]
 
     def skill_stats(self, skill_name: str) -> Dict[str, Any]:
         """Aggregate stats for one skill, overall and per version."""
@@ -314,8 +320,10 @@ class ExecutionTelemetry:
                 self._read_locked()  # count what's already there once
             with self._path.open("a", encoding="utf-8") as f:
                 f.write(payload)
-            # Other processes append too, so recount instead of trusting a cached
-            # count; only do the (cheap) size check every so often.
+            # This count only tracks our own appends (other processes append
+            # too), so it under-counts; when it crosses the threshold, recount
+            # from the file before deciding to compact. Growth past the cap is
+            # therefore bounded and self-correcting.
             self._line_count = (self._line_count or 0) + len(recs)
             if self._line_count > int(self._max_records * 1.25):
                 records = self._read_locked()
@@ -337,7 +345,15 @@ class ExecutionTelemetry:
             tmp.flush()
             os.fsync(tmp.fileno())
             tmp_path = Path(tmp.name)
-        os.replace(tmp_path, self._path)
+        for attempt in range(5):  # Windows: a reader may briefly hold the file open
+            try:
+                os.replace(tmp_path, self._path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         self._line_count = len(records)
 
 

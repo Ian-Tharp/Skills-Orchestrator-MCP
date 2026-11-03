@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import json
@@ -41,6 +42,9 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
 from packaging.requirements import InvalidRequirement, Requirement
+from referencing import Registry, Resource
+from referencing.exceptions import Unresolvable
+from referencing.jsonschema import DRAFT202012, specification_with
 
 # Enforcement modes (env SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT and
 # SKILL_ORCHESTRATOR_DEPENDENCY_ENFORCEMENT).
@@ -95,6 +99,13 @@ def _as_dependency_list(deps: Any) -> Tuple[List[str], List[str]]:
         else:
             invalid.append(f"{d!r} (not a requirement string)")
     return specs, invalid
+
+
+def format_dependencies(deps: Any) -> str:
+    """Comma-separated dependencies for display, whatever the stored value is."""
+    specs, invalid = _as_dependency_list(deps)
+    shown = specs + [i.split(" (")[0] for i in invalid]
+    return ", ".join(shown) or "None"
 
 
 def parse_dependency(spec: str) -> Tuple[str, str]:
@@ -180,18 +191,27 @@ def missing_dependencies(deps: Any) -> List[str]:
 
 
 def _is_importable(module: str) -> bool:
-    """Whether a top-level module exists, without importing anything.
+    """Whether a module exists, without importing anything.
 
-    Only the first dotted component is looked up: `find_spec('a.b')` imports
-    package `a`, which would run arbitrary package code inside the server.
+    `importlib.util.find_spec('a.b')` imports package `a`, which would run
+    arbitrary package code inside the server (and can write to the stdio
+    stream). So only the top-level name goes through `find_spec` (which
+    doesn't import for top-level names); each further part is looked up with
+    `PathFinder` inside the parent's search path.
     """
-    top = module.replace("-", "_").split(".")[0]
-    if not top.isidentifier():
+    parts = module.replace("-", "_").split(".")
+    if not all(p.isidentifier() for p in parts):
         return False
     try:
-        return importlib.util.find_spec(top) is not None
+        spec = importlib.util.find_spec(parts[0])
+        for i in range(1, len(parts)):
+            locations = spec.submodule_search_locations if spec is not None else None
+            if not locations:
+                return False  # a plain module has no submodules
+            spec = importlib.machinery.PathFinder.find_spec(".".join(parts[: i + 1]), list(locations))
     except (ImportError, ValueError):
         return False
+    return spec is not None
 
 
 def install_hint(missing: List[str]) -> str:
@@ -208,33 +228,32 @@ class SchemaUsageError(Exception):
     """The schema itself can't be applied (e.g. a $ref that doesn't resolve)."""
 
 
-def _iter_refs(node: Any) -> List[Any]:
-    refs: List[Any] = []
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if k == "$ref" and not isinstance(v, dict):
-                refs.append(v)
-            else:
-                refs.extend(_iter_refs(v))
-    elif isinstance(node, list):
-        for v in node:
-            refs.extend(_iter_refs(v))
-    return refs
+def _unresolvable_refs(schema: Mapping[str, Any]) -> List[str]:
+    """`$ref`s in `schema` that can't be resolved without network access.
 
+    Uses the `referencing` library (what jsonschema itself resolves with), so
+    only real schema positions are inspected: a "$ref" key inside a `default`
+    or `examples` value, or a property named "$ref", is not a reference.
+    Anchors, `$id`-relative and percent-encoded refs resolve normally.
+    """
+    spec = specification_with(str(schema.get("$schema", "")), default=DRAFT202012)
+    root: Resource[Any] = spec.create_resource(schema)
+    base = root.id() or ""
+    resolver = Registry().with_resource(uri=base, resource=root).resolver(base_uri=base)
+    bad: List[str] = []
 
-def _resolve_local_ref(schema: Mapping[str, Any], ref: str) -> bool:
-    if ref == "#":
-        return True
-    node: Any = schema
-    for part in ref[2:].split("/"):
-        part = part.replace("~1", "/").replace("~0", "~")
-        if isinstance(node, dict) and part in node:
-            node = node[part]
-        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
-            node = node[int(part)]
-        else:
-            return False
-    return True
+    def walk(resource: Resource[Any], res: Any) -> None:
+        contents = resource.contents
+        if isinstance(contents, dict) and isinstance(contents.get("$ref"), str):
+            try:
+                res.lookup(contents["$ref"])
+            except Unresolvable:
+                bad.append(contents["$ref"])
+        for sub in resource.subresources():
+            walk(sub, res.in_subresource(sub))
+
+    walk(root, resolver)
+    return bad
 
 
 def _describes_object(schema: Mapping[str, Any]) -> bool:
@@ -251,22 +270,27 @@ def _check_schema_cached(schema_json: str) -> Optional[str]:
         return None
     if not isinstance(schema, dict):
         return "parameters_schema must be a JSON object"
-    cls = validator_for(schema, default=Draft202012Validator)
+    if "$schema" in schema and not isinstance(schema["$schema"], str):
+        return "Invalid parameters_schema: $schema must be a string"
     try:
+        cls = validator_for(schema, default=Draft202012Validator)
         cls.check_schema(schema)
     except SchemaError as e:
         path = "/".join(str(p) for p in e.path)
         return f"Invalid parameters_schema: {e.message}" + (f" (at '{path}')" if path else "")
+    except Exception as e:
+        return f"Invalid parameters_schema: {type(e).__name__}: {e}"
     if not _describes_object(schema):
         return "parameters_schema must describe an object (params is always a dict)"
-    for ref in _iter_refs(schema):
-        if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
-            return (
-                f"Invalid parameters_schema: $ref {ref!r} is not supported "
-                "(only local references like '#/$defs/name')"
-            )
-        if not _resolve_local_ref(schema, ref):
-            return f"Invalid parameters_schema: $ref {ref!r} does not resolve"
+    try:
+        bad = _unresolvable_refs(schema)
+    except Exception as e:
+        return f"Invalid parameters_schema: could not resolve references ({type(e).__name__}: {e})"
+    if bad:
+        return (
+            f"Invalid parameters_schema: $ref {bad[0]!r} does not resolve "
+            "(references must point inside the schema; remote refs are not fetched)"
+        )
     return None
 
 
@@ -293,7 +317,7 @@ def validate_params(schema: Any, params: Any) -> List[str]:
     try:
         cls = (
             validator_for(schema, default=Draft202012Validator)
-            if isinstance(schema, dict)
+            if isinstance(schema, dict) and isinstance(schema.get("$schema", ""), str)
             else Draft202012Validator
         )
         errors = sorted(cls(schema).iter_errors(params), key=lambda e: list(e.path))

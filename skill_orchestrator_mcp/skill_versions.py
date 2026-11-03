@@ -51,7 +51,7 @@ def _is_safe_name(name: str) -> bool:
 def _as_version(raw: Any) -> int:
     try:
         v = int(float(raw))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 1
     return v if v >= 1 else 1
 

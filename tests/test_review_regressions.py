@@ -306,7 +306,7 @@ async def test_unresolvable_ref_rejected_at_create(storage: Storage) -> None:
     )
     assert "does not resolve" in msg
     remote = {"type": "object", "properties": {"a": {"$ref": "https://example.com/s.json"}}}
-    assert "not supported" in (contracts.check_schema(remote) or "")
+    assert "remote refs are not fetched" in (contracts.check_schema(remote) or "")
 
 
 async def test_legacy_unresolvable_ref_runs_with_warning(storage: Storage) -> None:
@@ -415,3 +415,195 @@ async def test_pipe_in_error_does_not_break_stats_table(storage: Storage) -> Non
 
     row = next(line for line in detail.splitlines() if line.startswith("| v1 "))
     assert row.count("|") - row.count("\\|") == 7
+
+
+# ----------------------------------------------------------------------------
+# Second review round (bugs introduced by the first round of fixes)
+# ----------------------------------------------------------------------------
+
+
+def test_dotted_dependencies_check_the_submodule_without_importing() -> None:
+    contracts._dep_cache.clear()
+    sys.modules.pop("this", None)
+    assert contracts.missing_dependencies(["json.decoder"]) == []
+    assert contracts.missing_dependencies(["json.nonexistent_submodule"])
+    assert contracts.missing_dependencies(["this.zen"])  # `this` is a module, not a package
+    assert "this" not in sys.modules
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        # "$ref" inside instance data is not a reference.
+        {"type": "object", "properties": {"a": {"default": {"$ref": "x"}, "examples": [{"$ref": "y"}]}}},
+        # A property literally named "$ref".
+        {"type": "object", "properties": {"$ref": True}},
+        # Percent-encoded JSON pointer.
+        {"type": "object", "$defs": {"a b": {"type": "string"}}, "properties": {"a": {"$ref": "#/$defs/a%20b"}}},
+        # $anchor and $id-relative references.
+        {"type": "object", "$defs": {"n": {"$anchor": "num", "type": "integer"}}, "properties": {"a": {"$ref": "#num"}}},
+        {
+            "$id": "https://example.com/root",
+            "type": "object",
+            "$defs": {"n": {"$id": "n.json", "type": "integer"}},
+            "properties": {"a": {"$ref": "https://example.com/n.json"}},
+        },
+    ],
+)
+def test_valid_ref_usages_are_accepted(schema: dict[str, Any]) -> None:
+    assert contracts.check_schema(schema) is None
+
+
+@pytest.mark.parametrize("bad", [["x"], {"a": 1}, 7])
+async def test_non_string_dollar_schema_is_rejected_cleanly(storage: Storage, bad: Any) -> None:
+    schema = {"$schema": bad, "type": "object"}
+    assert "$schema must be a string" in (contracts.check_schema(schema) or "")
+    msg = await server.create_skill(
+        CreateSkillInput(name="odd_schema", description="regression test", code="__result__ = 1",
+                         parameters_schema=schema)
+    )
+    assert msg.startswith("Error: Invalid parameters_schema")
+    _write_skill_file(storage, "odd_legacy", parameters_schema=schema)
+    out = await _invoke("odd_legacy")
+    assert "ran" in out and "Parameters not validated" in out
+
+
+async def test_string_dependency_is_not_split_into_characters(storage: Storage) -> None:
+    _write_skill_file(storage, "str_dep2", dependencies="surely-not-installed-pkg-xyz")
+
+    msg = await server.update_skill("str_dep2", description="updated description text")
+    shown = await server.get_skill("str_dep2")
+
+    assert "surely-not-installed-pkg-xyz" in msg and '"s" "u"' not in msg
+    assert "Dependencies:** surely-not-installed-pkg-xyz" in shown
+
+
+async def test_infinite_version_is_tolerated(storage: Storage) -> None:
+    (storage.skills_dir / "inf_version.json").write_text(
+        '{"id": "x", "name": "inf_version", "description": "d", "code": "__result__ = 1", "version": Infinity}'
+    )
+    server.SKILL_INDEX.rebuild()
+    assert "Result" in await _invoke("inf_version")
+    assert "Version:** 1" in await server.get_skill("inf_version")
+
+
+async def test_create_refuses_to_overwrite_empty_skill_file(storage: Storage) -> None:
+    (storage.skills_dir / "blank.json").write_text("{}")
+    msg = await server.create_skill(
+        CreateSkillInput(name="blank", description="regression test", code="__result__ = 1")
+    )
+    assert "already exists but is empty or unreadable" in msg
+    assert (storage.skills_dir / "blank.json").read_text() == "{}"
+
+
+async def test_nested_sys_exit_is_an_error_for_the_caller(storage: Storage) -> None:
+    await _create("child_exit", "set_state('c', 1)\nimport sys\nsys.exit(0)")
+    await _create(
+        "parent_of_exit",
+        "set_state('p', 1)\n"
+        "try:\n    invoke_skill('child_exit')\nexcept RuntimeError as e:\n    set_state('caught', str(e))\n"
+        "set_state('after', 1)",
+    )
+    await _create("parent_uncaught", "set_state('p2', 1)\ninvoke_skill('child_exit')\nset_state('after2', 1)")
+
+    caught = await _invoke("parent_of_exit")
+    uncaught = await _invoke("parent_uncaught")
+
+    state = _state(storage)
+    assert state == {"p": 1, "caught": "Skill 'child_exit' called sys.exit(0)", "after": 1}
+    assert "called sys.exit(0)" in uncaught and "discarded" in uncaught
+    assert "committed" in caught
+
+
+async def test_parent_invoke_skill_wrapper_reaches_grandchildren(storage: Storage) -> None:
+    await _create("leaf2", "__result__ = 'leaf'")
+    await _create("mid2", "__result__ = invoke_skill('leaf2')")
+    await _create(
+        "tracer",
+        "calls = []\n_orig = invoke_skill\n"
+        "def invoke_skill(name, *a, **k):\n    calls.append(name)\n    return _orig(name, *a, **k)\n"
+        "invoke_skill('mid2')\n__result__ = calls",
+    )
+
+    out = await _invoke("tracer")
+
+    assert '"mid2",\n  "leaf2"' in out
+
+
+async def test_warn_mode_passes_non_dict_nested_params(storage: Storage, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT", "warn")
+    await _create("typed_list", "__result__ = len(params)", parameters_schema={"type": "object"})
+    await _create("sends_list", "__result__ = invoke_skill('typed_list', [1, 2])")
+
+    out = await _invoke("sends_list")
+
+    assert "**Result:**\n```\n2\n```" in out and "expected a dict" in out
+
+
+async def test_child_rolls_back_even_if_its_exception_cannot_be_printed(storage: Storage) -> None:
+    await _create(
+        "unprintable",
+        "class Weird(Exception):\n    def __str__(self):\n        raise RuntimeError('no str')\n"
+        "set_state('child', 1)\nraise Weird()",
+    )
+    await _create("catches_weird", "try:\n    invoke_skill('unprintable')\nexcept Exception:\n    pass")
+
+    await _invoke("catches_weird")
+
+    assert _state(storage) == {}
+
+
+async def test_sys_exit_with_message_reads_cleanly(storage: Storage) -> None:
+    await _create("exit_msg", "import sys\nsys.exit('fatal: bad input')")
+    out = await _invoke("exit_msg")
+    assert "sys.exit('fatal: bad input')" in out
+
+
+async def test_lock_wait_does_not_block_the_event_loop(storage: Storage, tmp_path: Path) -> None:
+    import asyncio
+
+    from skill_orchestrator_mcp.models import StateInput
+
+    holder = subprocess.Popen(
+        [sys.executable, "-c", textwrap.dedent(f"""
+            import sys, time
+            sys.path.insert(0, {str(REPO_ROOT)!r})
+            from pathlib import Path
+            from skill_orchestrator_mcp.locking import file_lock
+            with file_lock(Path({str(storage.state_dir / ".state.lock")!r})):
+                print("held", flush=True)
+                time.sleep(1.5)
+        """)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout is not None and holder.stdout.readline().strip() == "held"
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.05)
+            ticks += 1
+
+    t = asyncio.create_task(ticker())
+    msg = await server.set_state(StateInput(key="k", value=1))
+    t.cancel()
+    holder.communicate(timeout=10)
+
+    assert msg.startswith("✅")
+    assert ticks >= 10  # the loop kept running while set_state waited ~1.5 s for the lock
+
+
+def test_lock_falls_back_when_locking_is_unsupported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import errno
+
+    from skill_orchestrator_mcp import locking
+
+    def unsupported(fd: int) -> bool:
+        return locking._classify(OSError(errno.ENOLCK, "No locks available"))
+
+    monkeypatch.setattr(locking, "_try_lock", unsupported)
+    with locking.file_lock(tmp_path / "x.lock", timeout=0.5):
+        pass  # no 30 s wait, no exception
