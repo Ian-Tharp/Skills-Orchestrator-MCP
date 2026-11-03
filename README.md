@@ -349,10 +349,17 @@ How writes behave:
   child's writes are rolled back; the parent's are kept.
 - **Read your writes.** Within a run, `get_state` sees pending writes.
 - **Merge, not overwrite.** On commit, the run's operations are replayed onto
-  the current file, so keys the skill didn't touch (for example, written by
-  another agent meanwhile) are preserved. Last writer wins per key.
-- Values must be JSON-serializable (checked at `set_state` time). Namespaces
-  follow the same rules as the tools (no path separators, no leading dot).
+  the current file under a cross-process file lock, so keys the skill didn't
+  touch (for example, written meanwhile by another agent or another server
+  process) are preserved. Last writer wins per key.
+- `sys.exit(0)` in the top-level skill ends the run cleanly (writes are
+  committed); any other exit code, an exception or a timeout discards them.
+  In a nested skill, `sys.exit()` rolls back that child's writes; the caller
+  can catch the `SystemExit`, and if nothing does, the whole run fails (it
+  is not treated as a clean finish).
+- Values must be strict JSON (checked at `set_state` time; `NaN` and
+  `Infinity` are rejected). Namespaces follow the same rules as the tools (no
+  path separators, no leading dot).
 
 The legacy in-process mode (`SKILL_ORCHESTRATOR_EXEC_MODE=inprocess`) does not
 provide the state bridge or composition.
@@ -371,7 +378,8 @@ Every create, update and rollback saves a full snapshot
 
 ```python
 update_skill(name="csv_summary", code=new_code, change_note="stream rows",
-             expected_version=3)            # refused if someone else edited it first
+             expected_version=3)            # refused if someone else edited it first,
+                                            # even from another server process
 list_skill_versions("csv_summary")          # runs / failure rate / p50 per version
 diff_skill_versions("csv_summary", from_version=3)
 rollback_skill("csv_summary", version=3)    # saved as v5; the rollback can be undone too
@@ -381,14 +389,19 @@ An update that changes nothing does not create a version.
 
 ### Contracts: dependencies and parameter schemas
 
-- **`dependencies`** are requirement strings (`"pandas"`, `"requests>=2.31"`).
-  They are checked against the interpreter that runs skills. Unparseable
-  strings are rejected at create/update; unmet ones produce a warning, and the
-  skill is refused at invoke time with an install hint instead of failing
-  mid-run with `ImportError`.
-- **`parameters_schema`** must be a valid JSON Schema for an object. Every
-  invocation is validated against it before the skill runs, and top-level
-  `default` values are filled in. Control this with
+- **`dependencies`** are requirement strings (`"pandas"`, `"requests>=2.31"`,
+  `"python>=3.11"`). They are checked against the interpreter that runs skills,
+  without importing anything. Unparseable strings are rejected at
+  create/update; unmet ones produce a warning there, and the skill is refused
+  at invoke time with an install hint instead of failing mid-run with
+  `ImportError`. Free-form entries already stored in older skills (e.g.
+  `"json (stdlib)"`) are reported as warnings and never block a run. Control
+  this with `SKILL_ORCHESTRATOR_DEPENDENCY_ENFORCEMENT` (`strict`, `warn`,
+  `off`).
+- **`parameters_schema`** must be a valid JSON Schema for an object (the draft
+  is taken from `$schema`, default 2020-12; every `$ref` must resolve inside
+  the schema, since remote references are never fetched). Every invocation is validated against it before
+  the skill runs, and top-level `default` values are filled in. Control this with
   `SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT` (`strict`, `warn`, `off`). Legacy
   skills whose stored schema is invalid run with a warning.
 - **Skill-to-skill references** (`invoke_skill('name', ...)` with a literal
@@ -401,7 +414,7 @@ Runs refused by a contract are recorded in telemetry with status `rejected`.
 ### Execution telemetry
 
 Every run is appended to `~/.skill_orchestrator/telemetry/executions.jsonl`
-(local only, capped at 10,000 records) with timestamp, skill, version, status
+(local only; once it passes 12,500 records it is trimmed to the newest 10,000) with timestamp, skill, version, status
 (`ok`, `error`, `timeout`, `rejected`), wall-clock and in-child execution time,
 error summary, parent skill and depth for nested calls, and the number of
 state writes committed.
@@ -570,6 +583,7 @@ When skills fail, error messages include:
 | `SKILL_ORCHESTRATOR_MAX_CALL_DEPTH` | 10 | Maximum skill nesting depth |
 | `SKILL_ORCHESTRATOR_EXEC_MODE` | subprocess | Execution mode (subprocess or inprocess) |
 | `SKILL_ORCHESTRATOR_SCHEMA_ENFORCEMENT` | strict | Parameter schema checks: `strict` (reject), `warn` (run and report), `off` |
+| `SKILL_ORCHESTRATOR_DEPENDENCY_ENFORCEMENT` | strict | Dependency checks: `strict` (refuse), `warn` (run and report), `off` |
 | `SKILL_ORCHESTRATOR_TELEMETRY` | on | Set to `off` to stop recording executions |
 | `SKILL_ORCHESTRATOR_TELEMETRY_MAX_RECORDS` | 10000 | Telemetry log size cap (oldest records dropped) |
 | `SKILL_ORCHESTRATOR_MAX_SKILL_VERSIONS` | 50 | Snapshots kept per skill |

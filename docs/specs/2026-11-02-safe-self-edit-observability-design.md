@@ -51,11 +51,40 @@ Agents can create and rewrite skills, but nothing protects them when they do:
 - A nested `invoke_skill` that raises has its ops truncated (and the read cache cleared) before the exception propagates. A parent that catches the error therefore keeps its own writes but not the child's.
 - The MCP state tools now also take the state lock and write atomically, and a `delete_state` tool was added for parity.
 
+## Hardening after review
+
+A bug-hunt review reproduced the following problems; each is fixed and covered by `tests/test_review_regressions.py`.
+
+- **Run status:** an exception with an empty message (bare `assert`) was recorded as `ok`. `sys.exit(0)` silently dropped state writes, and `os._exit(0)` looked like success. An unserializable `__result__` lost the whole result payload, including the state ops. The runner now catches `BaseException`, treats `SystemExit(0/None)` as a clean finish, falls back to the exception type as the message, and degrades an unserializable result to its `repr()`.
+- **Composition compatibility:** nested calls once again pass the caller's `parameters` object through unchanged (any type, same object) unless a schema needs defaults filled. Children get the helper functions captured by the runner, so a parent that defines its own `set_state` can't hijack them.
+- **Cross-process safety:** each MCP client runs its own server process. State commits, the state tools, skill create/update/rollback/delete and telemetry appends/compaction now take an OS-level file lock (`locking.py`, `fcntl`/`msvcrt`), so `expected_version` and the state merge hold across processes. A state commit stages every namespace file before replacing any, and its message says exactly what was written.
+- **Legacy data:** malformed `dependencies` values (`null`, numbers, a bare string), free-form dependency notes, string versions (`"1.0"`), boolean schemas and schemas with unresolvable `$ref`s no longer crash an invocation or break unrelated skills. Free-form dependencies become warnings, and `SKILL_ORCHESTRATOR_DEPENDENCY_ENFORCEMENT` adds a switch.
+- **Safety:** dependency checks never import a package (a dotted name used to run its parent package's code inside the server, which could write to the stdio stream). Snapshot paths come from the validated skill name, never from the `name` field inside a file. A skill created over leftover history starts clean. `NaN` can't be written to state.
+- **Telemetry:** "last run" and recent-run order use timestamps, not file order, since nested records are written when the parent finishes. `record()` never raises, and `|` in errors no longer breaks the markdown tables.
+- **Performance:** dependency, schema and skill-reference checks are cached, and the registry is built off the event loop. With 200 skills, building the registry takes about 6 ms (it took about 144 ms before the fix, and about 5 ms before this change).
+
+A second review of those fixes found and fixed:
+
+- **Lock waits blocked the event loop.** Tools that take a file lock now do that work in a worker thread, so a lock held by another process no longer freezes every other request. Thread and file waits share one deadline. On file systems without lock support, locking falls back to in-process only, with a warning, instead of timing out every write.
+- **Nested `sys.exit(0)`** committed a cut-off parent as `ok`. A child's `SystemExit` is still raised in the caller (so `except SystemExit` keeps working), but one that reaches the top level now fails the run. A child whose exception can't be converted to a string is still rolled back.
+- **Composition helpers:** only the state bridge is pinned to the runner's helpers. A parent that wraps `invoke_skill` (for example to trace its subtree) applies to grandchildren again, as before. In `warn` mode, non-dict nested parameters pass through with a warning.
+- **Contracts:**
+  - `$ref`s are resolved with `referencing` (the library jsonschema uses), so `"$ref"` keys inside `default`/`examples`, a property named `$ref`, anchors, `$id`-relative and percent-encoded refs are all accepted, and remote refs are reported as unresolvable.
+  - A non-string `$schema` is rejected cleanly.
+  - Dotted dependency names check the submodule itself, still without importing.
+  - A bare-string dependency is displayed and checked as one requirement.
+- **Edge cases:**
+  - An infinite `version` is tolerated.
+  - `create_skill` won't overwrite an existing empty or corrupt skill file.
+  - Temp files are cleaned up on every failed replace.
+  - Telemetry `clear()` is best effort and only rewrites the log when it removes something.
+
 ## Behavior changes
 
 - `delete_skill` on a skill that other skills call needs `force=True`.
 - `invoke_skill` refuses skills with unmet dependencies or invalid parameters (in `strict` mode) instead of running them.
 - The `invoke_skill` header now includes the version: `## Skill Execution: name (v3)`.
+- `sys.exit(0)` in a top-level skill is now a clean finish (its state writes commit). Before, the run ended without a result. In a nested skill it rolls back the child; if the caller doesn't catch it, the run fails.
 
 ## Not covered
 

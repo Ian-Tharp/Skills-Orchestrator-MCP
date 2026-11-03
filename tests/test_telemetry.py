@@ -108,6 +108,14 @@ def test_recent_is_newest_first(tmp_path: Path) -> None:
     assert [r["duration_ms"] for r in t.recent(skill_name="s", limit=2)] == [3.0, 2.0]
 
 
+def test_recent_breaks_timestamp_ties_by_file_order(tmp_path: Path) -> None:
+    # Windows clocks are coarse enough that consecutive runs share a timestamp.
+    t = ExecutionTelemetry(tmp_path)
+    for ms in (1, 2, 3):
+        t.record(kind="skill", status="ok", duration_ms=ms, skill_name="s", ts="2026-01-01T00:00:00+00:00")
+    assert [r["duration_ms"] for r in t.recent(skill_name="s", limit=2)] == [3.0, 2.0]
+
+
 # ----------------------------------------------------------------------------
 # What the server records
 # ----------------------------------------------------------------------------

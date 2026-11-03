@@ -12,13 +12,13 @@ The index is stored alongside skills as a dotfile so it is excluded from
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
+
+from . import fileio
 
 INDEX_SCHEMA_VERSION = 1
 DEFAULT_INDEX_FILENAME = ".skill_index.json"
@@ -37,25 +37,7 @@ def _utc_now_iso() -> str:
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    """Write JSON atomically to avoid partial/corrupt files."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Use same directory for atomic replace on Windows.
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-        dir=str(path.parent),
-        prefix=path.name + ".",
-        suffix=".tmp",
-    ) as tmp:
-        json.dump(data, tmp, indent=2, default=str)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
-
-    os.replace(tmp_path, path)
+    fileio.atomic_write_json(path, data)
 
 
 def _is_skill_filename(path: Path) -> bool:

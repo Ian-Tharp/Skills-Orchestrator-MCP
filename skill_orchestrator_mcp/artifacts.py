@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from . import fileio
+
 DEFAULT_MAX_ARTIFACT_BYTES = 5 * 1024 * 1024  # 5 MiB
 DEFAULT_CHUNK_BYTES = 10_000  # for tool responses
 
@@ -42,11 +44,11 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp_path = Path(tmp.name)
-    os.replace(tmp_path, path)
+    fileio.replace_file(tmp_path, path)
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    _atomic_write_bytes(path, json.dumps(data, indent=2, default=str).encode("utf-8"))
+    fileio.atomic_write_json(path, data)
 
 
 def _generate_artifact_id() -> str:

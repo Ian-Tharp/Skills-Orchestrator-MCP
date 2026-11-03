@@ -195,6 +195,6 @@ async def test_delete_removes_history_and_telemetry(storage: Storage) -> None:
 def test_store_prunes_to_max_versions(tmp_path: Path) -> None:
     store = SkillVersionStore(tmp_path, max_versions=3)
     for v in range(1, 7):
-        store.save({"name": "p", "version": v, "code": f"x = {v}"})
+        store.save("p", {"name": "p", "version": v, "code": f"x = {v}"})
 
     assert store.versions("p") == [4, 5, 6]
