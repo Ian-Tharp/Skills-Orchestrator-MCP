@@ -15,13 +15,13 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
-import os
 import re
 import shutil
-import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
+
+from . import fileio
 
 DEFAULT_VERSIONS_DIRNAME = ".versions"
 DEFAULT_MAX_VERSIONS = 50
@@ -61,20 +61,7 @@ def code_digest(code: str) -> str:
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-        dir=str(path.parent),
-        prefix=path.name + ".",
-        suffix=".tmp",
-    ) as tmp:
-        json.dump(data, tmp, indent=2, default=str)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
-    os.replace(tmp_path, path)
+    fileio.atomic_write_json(path, data)
 
 
 class SkillVersionStore:

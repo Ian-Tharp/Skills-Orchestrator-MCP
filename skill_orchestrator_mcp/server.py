@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from . import fileio
 from . import skill_contracts as contracts
 from .artifacts import ArtifactStore
 from .locking import file_lock
@@ -248,47 +249,11 @@ def _load_skill(name: str) -> Optional[Dict[str, Any]]:
 
 
 def _write_temp_json(path: Path, data: Any) -> Path:
-    """Write JSON to a temp file next to `path` (same dir, so a rename is atomic)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-        dir=str(path.parent),
-        prefix=path.name + ".",
-        suffix=".tmp",
-    ) as tmp:
-        tmp_path = Path(tmp.name)
-        try:
-            json.dump(data, tmp, indent=2, default=str)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        except BaseException:
-            tmp.close()
-            tmp_path.unlink(missing_ok=True)
-            raise
-    return tmp_path
+    return fileio.write_temp_json(path, data)
 
 
 def _replace_file(tmp_path: Path, path: Path) -> None:
-    """os.replace with a short retry: on Windows the target may be briefly open elsewhere.
-
-    On final failure the temp file is removed, so failed writes never leave
-    `.tmp` files behind.
-    """
-    for attempt in range(5):
-        try:
-            os.replace(tmp_path, path)
-            return
-        except PermissionError:
-            if attempt < 4:
-                time.sleep(0.05 * (attempt + 1))
-                continue
-            tmp_path.unlink(missing_ok=True)
-            raise
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
+    fileio.replace_file(tmp_path, path)
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:

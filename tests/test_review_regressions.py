@@ -187,12 +187,11 @@ def _run_workers(script: str, home: Path, n: int = 2) -> list[str]:
         )
         for i in range(n)
     ]
-    outs = []
-    for p in procs:
-        out, err = p.communicate(timeout=120)
+    # Reap every worker before asserting, so a failure can't leak a running process.
+    results = [p.communicate(timeout=120) for p in procs]
+    for p, (_, err) in zip(procs, results):
         assert p.returncode == 0, err
-        outs.append(out)
-    return outs
+    return [out for out, _ in results]
 
 
 def test_state_commits_from_separate_processes_are_not_lost(tmp_path: Path) -> None:
@@ -626,3 +625,17 @@ def test_unresolvable_dynamic_ref_rejected_at_create() -> None:
     }
     assert "does not resolve" in (contracts.check_schema(bad) or "")
     assert contracts.check_schema(good) is None
+
+
+def test_servers_starting_at_the_same_time_do_not_crash(tmp_path: Path) -> None:
+    # Each MCP client starts its own server; on Windows, simultaneous startups
+    # rewriting the skill index used to fail os.replace with "Access is denied".
+    script = """
+        import asyncio, sys
+        from skill_orchestrator_mcp import server
+        for _ in range(30):
+            server.SKILL_INDEX.rebuild()
+            server.USAGE_TRACKER.increment("x")
+            server.USAGE_TRACKER.flush()
+    """
+    _run_workers(script, tmp_path, n=4)
