@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import sandbox_env
+from . import sandbox_env, skill_md
 from . import skill_contracts as contracts
 from . import skill_verification as verification
 from .artifacts import ArtifactStore
@@ -2496,6 +2496,123 @@ async def delete_skill(name: str, confirm: bool = False, force: bool = False) ->
     if dependents:
         msg += f"\n\n**Warning:** these skills still call it and will fail: {', '.join(dependents)}"
     return msg
+
+
+# =============================================================================
+# Portability: SKILL.md (agentskills.io) export / import
+# =============================================================================
+
+def _portable_path(raw: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve a client-supplied folder path; enforce SKILL_ORCHESTRATOR_PORTABLE_ROOT if set."""
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        return None, f"Error: Path must be absolute, got '{raw}'."
+    path = path.resolve()
+    root_raw = os.environ.get("SKILL_ORCHESTRATOR_PORTABLE_ROOT", "").strip()
+    if root_raw:
+        root = Path(root_raw).expanduser().resolve()
+        if path != root and root not in path.parents:
+            return None, (
+                f"Error: '{path}' is outside the allowed folder '{root}' "
+                "(SKILL_ORCHESTRATOR_PORTABLE_ROOT)."
+            )
+    return path, None
+
+
+@mcp.tool(
+    name="export_skill",
+    annotations=ToolAnnotations(
+        title="Export a Skill as a SKILL.md Folder",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False
+    )
+)
+async def export_skill(name: str, directory: str, overwrite: bool = False) -> str:
+    """Write a skill as an agentskills.io folder (SKILL.md + scripts/) other agents can use.
+
+    Creates `<directory>/<skill-name>/` with SKILL.md (frontmatter name and
+    description, usage instructions), scripts/<name>.py (the code),
+    scripts/run.py (runs it standalone), examples/examples.json (examples
+    and test cases) and references/parameters.schema.json (if any).
+
+    Args:
+        name: Skill to export
+        directory: Absolute path of the parent folder to write into
+        overwrite: Replace those files if the skill folder already exists
+            (other files in it are left alone)
+
+    Returns:
+        str: The folder and files written
+    """
+    skill = _load_skill(name)
+    if not skill:
+        return f"Error: Skill '{name}' not found."
+    target, error = _portable_path(directory)
+    if error or target is None:
+        return error or "Error: invalid directory."
+    try:
+        root, written = skill_md.export_skill_dir(
+            skill, target, common_imports=_COMMON_IMPORTS, overwrite=overwrite
+        )
+    except (skill_md.SkillMdError, OSError) as e:
+        return f"Error: Could not export '{name}': {e}"
+    files = "\n".join(f"- `{p.relative_to(root).as_posix()}`" for p in written)
+    return (
+        f"✅ Exported '{name}' (v{skill.get('version', 1)}) to `{root}`\n\n{files}\n\n"
+        f"Import it elsewhere with import_skill(path='{root}')."
+    )
+
+
+@mcp.tool(
+    name="import_skill",
+    annotations=ToolAnnotations(
+        title="Import a Skill from a SKILL.md Folder",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False
+    )
+)
+async def import_skill(
+    path: str, name: Optional[str] = None, save_as_draft: bool = False
+) -> str:
+    """Create a skill from an agentskills.io folder (SKILL.md + scripts/*.py).
+
+    Reads frontmatter name/description, the code (metadata.entrypoint, or the
+    single script in scripts/), and, when present, examples/examples.json and
+    references/parameters.schema.json. The skill goes through create_skill,
+    so its test cases run in the sandbox before it is saved.
+
+    Args:
+        path: Absolute path of the skill folder (or its SKILL.md)
+        name: Save under this name instead of the one in SKILL.md
+        save_as_draft: Save even if a test case fails (status 'draft')
+
+    Returns:
+        str: create_skill's result, or why the folder could not be read
+    """
+    source, error = _portable_path(path)
+    if error or source is None:
+        return error or "Error: invalid path."
+    try:
+        fields = skill_md.read_skill_dir(source)
+    except (skill_md.SkillMdError, OSError, UnicodeDecodeError) as e:
+        return f"Error: Could not read skill folder '{source}': {e}"
+    if name:
+        fields["name"] = name
+    try:
+        fields["category"] = SkillCategory(fields["category"])
+    except ValueError:
+        fields["category"] = SkillCategory.CUSTOM
+    if len(fields["description"]) > 1000:
+        fields["description"] = fields["description"][:999] + "…"
+    try:
+        params = CreateSkillInput(**fields, save_as_draft=save_as_draft)
+    except ValueError as e:
+        return f"Error: '{source}' is not a valid skill: {e}"
+    return str(await create_skill(params))
 
 
 # =============================================================================
