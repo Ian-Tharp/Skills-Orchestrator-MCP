@@ -901,9 +901,10 @@ async def execute_code(params: ExecuteCodeInput) -> str:
     - Perform computations locally
     - Test skill code before saving
 
-    Security note: Code runs in an isolated namespace but has access to
-    standard library. External network calls and file operations are allowed
-    but should be used carefully.
+    Security note: Code runs in a separate Python process with a timeout and
+    an allowlisted environment (no API keys or other server env vars). It is
+    NOT a sandbox: it runs as the server's user, with the same filesystem and
+    network access.
 
     Args:
         params: ExecuteCodeInput containing:
