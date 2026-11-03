@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from skill_orchestrator_mcp import builtin_skills
+from skill_orchestrator_mcp import skill_contracts as contracts
 from skill_orchestrator_mcp.models import CreateSkillInput
 
 
@@ -17,6 +19,13 @@ def test_builtin_skill_is_valid(skill: dict[str, object]) -> None:
     fields = ("name", "description", "code", "category", "tags", "examples")
     CreateSkillInput.model_validate({k: skill[k] for k in fields if k in skill})
     compile(str(skill["code"]), f"builtin_{skill['name']}", "exec")
+
+
+@pytest.mark.parametrize("skill", builtin_skills.BUILTIN_SKILLS, ids=lambda s: s["name"])
+def test_builtin_skill_contracts_are_valid(skill: dict[str, Any]) -> None:
+    # invoke_skill enforces these, so a bad built-in schema would block the skill.
+    assert contracts.check_schema(skill.get("parameters_schema")) is None
+    assert contracts.invalid_dependencies(list(skill.get("dependencies") or [])) == []
 
 
 def test_builtin_names_are_unique() -> None:
