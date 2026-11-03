@@ -213,6 +213,7 @@ async def test_subprocesses_blocked(storage: Storage, monkeypatch: pytest.Monkey
         assert "Sandbox warning" in outcome.text and "root" in outcome.text
     else:
         assert outcome.status == server.STATUS_ERROR, outcome.text
+        assert "before reporting a result" not in outcome.text  # the run itself started
 
     monkeypatch.delenv("SKILL_ORCHESTRATOR_ALLOW_SUBPROCESSES")
     allowed = await server._run_code(SPAWN)
@@ -270,7 +271,7 @@ async def test_restricted_runs_only_verified_skills(
         monkeypatch.setenv("SKILL_ORCHESTRATOR_ALLOW_SUBPROCESSES", "on")
 
     ok = await server.invoke_skill(InvokeSkillInput(skill_name="checked", parameters={"x": 5}))
-    assert "10" in ok and "Error" not in ok.split("\n")[0], ok
+    assert "Error" not in ok and "10" in ok, ok
 
     refused = await server.invoke_skill(
         InvokeSkillInput(skill_name="unchecked", parameters={"x": 5})
@@ -313,8 +314,13 @@ async def test_restricted_blocks_subprocesses(
     storage: Storage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("SKILL_ORCHESTRATOR_TRUST_TIER", "restricted")
+    # The run itself starts (on Windows that includes a venv launcher)...
+    plain = await server._run_code("__result__ = 1")
+    assert plain.status == server.STATUS_OK and plain.result == 1, plain.text
+    # ...but the code cannot start another process.
     outcome = await server._run_code(SPAWN)
     assert outcome.status == server.STATUS_ERROR, outcome.text
+    assert "before reporting a result" not in outcome.text
 
 
 async def test_status_reports_trust_tier(

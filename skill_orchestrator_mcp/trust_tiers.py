@@ -235,7 +235,7 @@ def describe_limits(limits: ResourceLimits, *, is_windows: Optional[bool] = None
     if limits.allow_subprocesses:
         out["subprocesses"] = "allowed (killed with the run)"
     elif is_windows:
-        out["subprocesses"] = "blocked (job object active-process limit 1)"
+        out["subprocesses"] = "blocked (job object active-process limit; venv launcher counted)"
     else:
         root = hasattr(os, "geteuid") and os.geteuid() == 0
         out["subprocesses"] = "blocked (RLIMIT_NPROC=0; also blocks threads on Linux)" + (

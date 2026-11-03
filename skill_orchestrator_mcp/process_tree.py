@@ -140,6 +140,24 @@ class ProcessTree:
                 pass
 
 
+def venv_launcher_processes() -> int:
+    """Extra processes the interpreter itself needs before any skill code runs.
+
+    In a Windows virtual environment ``python.exe`` is a launcher that starts
+    the base interpreter as a child process (both the stdlib ``venv``
+    redirector and uv's trampoline), so a run needs two processes in its job.
+    """
+    if sys.platform == "win32":
+        base = getattr(sys, "_base_executable", sys.executable)
+        try:
+            same = os.path.samefile(base, sys.executable)
+        except OSError:
+            same = os.path.normcase(base) == os.path.normcase(sys.executable)
+        return 0 if same else 1
+    else:
+        return 0
+
+
 async def wait_for_exit(proc: "asyncio.subprocess.Process", timeout: float) -> bool:
     """Wait until the root process exits; True if it did within ``timeout``.
 
@@ -262,7 +280,7 @@ if sys.platform == "win32":
             info.JobMemoryLimit = limits.memory_mb * 1024 * 1024
         if not limits.allow_subprocesses:
             flags |= _JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            info.BasicLimitInformation.ActiveProcessLimit = 1
+            info.BasicLimitInformation.ActiveProcessLimit = 1 + venv_launcher_processes()
         info.BasicLimitInformation.LimitFlags = flags
         if not _kernel32.SetInformationJobObject(
             job, _JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)

@@ -923,7 +923,7 @@ never change its tool policy. How each limit is enforced:
 |---|---|---|
 | Memory | `RLIMIT_AS`, per process | Job object, committed memory of the whole tree |
 | File size | `RLIMIT_FSIZE`, per file | Not enforced |
-| No processes | `RLIMIT_NPROC=0`. On Linux this also blocks new threads. Not enforced for root: run as another user, or set `SKILL_ORCHESTRATOR_ALLOW_SUBPROCESSES=on` to accept that | Job object active-process limit of 1 |
+| No processes | `RLIMIT_NPROC=0`. On Linux this also blocks new threads. Not enforced for root: run as another user, or set `SKILL_ORCHESTRATOR_ALLOW_SUBPROCESSES=on` to accept that | Job object active-process limit of 1 (2 when `python.exe` is a venv launcher, which starts the real interpreter as a child) |
 
 POSIX limits are set by the runner before any skill code runs, with hard
 limits lowered so the code cannot raise them again. On Windows the runner

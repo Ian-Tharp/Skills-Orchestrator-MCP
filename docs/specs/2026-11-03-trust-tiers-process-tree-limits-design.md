@@ -80,7 +80,9 @@ address space leaves room for numpy/pandas thread pools and malloc arenas
   `RLIMIT_NPROC` is per user and ignored for root; the runner reports it as
   not applied when running as root.
 - Windows: the job object sets `JobMemoryLimit` (whole tree) and
-  `ActiveProcessLimit=1`. File size is not enforced.
+  `ActiveProcessLimit=1`, or 2 when `python.exe` is a venv launcher
+  (stdlib venv redirector, uv trampoline), which starts the base interpreter
+  as a child before any skill code runs. File size is not enforced.
 - Limits that could not be applied come back in the result payload
   (`limit_failures`) and are shown as a sandbox warning, or, when the tier
   requires limits, the runner refuses before running any code
