@@ -23,7 +23,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -38,6 +37,7 @@ from mcp.types import ToolAnnotations
 
 from . import skill_contracts as contracts
 from .artifacts import ArtifactStore
+from .locking import file_lock
 from .models import (
     CreateSkillInput,
     ExecuteCodeInput,
@@ -68,7 +68,7 @@ from .usage_stats import UsageTracker
 try:
     SERVER_VERSION = importlib.metadata.version("skill-orchestrator-mcp")
 except importlib.metadata.PackageNotFoundError:  # running from a source checkout
-    SERVER_VERSION = "0.0.0+unknown"
+    SERVER_VERSION = str(getattr(sys.modules.get(__package__ or ""), "__version__", "0.0.0+unknown"))
 
 # =============================================================================
 # Configuration
@@ -173,8 +173,20 @@ SKILL_VERSIONS = SkillVersionStore(
     max_versions=max(1, _get_int_env("SKILL_ORCHESTRATOR_MAX_SKILL_VERSIONS", 50)),
 )
 
-# Serializes read-modify-write of state files (MCP tools + state bridge commits).
-_STATE_LOCK = threading.Lock()
+
+
+def _state_lock() -> Any:
+    """Serialize read-modify-write of state files across threads and processes."""
+    return file_lock(DEFAULT_STATE_DIR / ".state.lock")
+
+
+def _skills_lock() -> Any:
+    """Serialize skill create/update/rollback/delete across threads and processes."""
+    return file_lock(DEFAULT_SKILLS_DIR / ".skills.lock")
+
+
+class StateCommitError(Exception):
+    """A state-bridge commit failed; the message says what (if anything) was written."""
 
 # Index refresh debounce (to detect out-of-band skill file changes without rescanning constantly)
 _INDEX_REFRESH_CHECK_INTERVAL_SECONDS = 2.0
@@ -235,8 +247,8 @@ def _load_skill(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _atomic_write_json(path: Path, data: Any) -> None:
-    """Write JSON via temp file + rename so readers never see a partial file."""
+def _write_temp_json(path: Path, data: Any) -> Path:
+    """Write JSON to a temp file next to `path` (same dir, so a rename is atomic)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -246,11 +258,44 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         prefix=path.name + ".",
         suffix=".tmp",
     ) as tmp:
-        json.dump(data, tmp, indent=2, default=str)
-        tmp.flush()
-        os.fsync(tmp.fileno())
         tmp_path = Path(tmp.name)
-    os.replace(tmp_path, path)
+        try:
+            json.dump(data, tmp, indent=2, default=str)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        except BaseException:
+            tmp.close()
+            tmp_path.unlink(missing_ok=True)
+            raise
+    return tmp_path
+
+
+def _replace_file(tmp_path: Path, path: Path) -> None:
+    """os.replace with a short retry: on Windows the target may be briefly open elsewhere."""
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                tmp_path.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Write JSON via temp file + rename so readers never see a partial file."""
+    _replace_file(_write_temp_json(path, data), path)
+
+
+def _skill_version(skill: Dict[str, Any]) -> int:
+    """A skill's version as an int, tolerating legacy values like "2" or "1.0"."""
+    raw = skill.get("version", 1)
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return 1
+    return v if v >= 1 else 1
 
 
 def _save_skill(skill_data: Dict[str, Any]) -> None:
@@ -289,38 +334,68 @@ def _delete_nested_value(data: Dict[str, Any], key: str) -> bool:
 def _commit_state_ops(ops: List[Dict[str, Any]]) -> Dict[str, int]:
     """Apply state writes buffered by a skill run (the state bridge).
 
-    Ops are replayed onto the *current* file contents, so concurrent writes to
-    other keys are preserved (last writer wins per key). All ops are applied
-    in memory first; if any is invalid nothing is written.
+    Ops are replayed onto the *current* file contents under a cross-process
+    lock, so concurrent writes to other keys are preserved (last writer wins
+    per key). All ops are applied in memory and every namespace file is
+    staged before any is replaced, so a bad op or a failed write leaves
+    nothing written.
 
-    Returns the number of ops applied per namespace. Raises ValueError on an
-    invalid op.
+    Returns the number of ops applied per namespace. Raises StateCommitError.
     """
     if not ops:
         return {}
-    with _STATE_LOCK:
+    with _state_lock():
         loaded: Dict[str, Dict[str, Any]] = {}
         counts: Dict[str, int] = {}
-        for op in ops:
-            if not isinstance(op, dict):
-                raise ValueError("malformed state op")
-            ns = op.get("namespace")
-            key = op.get("key")
-            if not isinstance(ns, str) or not _is_safe_storage_name(ns):
-                raise ValueError(f"invalid state namespace {ns!r}")
-            if not isinstance(key, str) or not key:
-                raise ValueError(f"invalid state key {key!r}")
-            if ns not in loaded:
-                loaded[ns] = _load_state(ns)
-            if op.get("op") == "set":
-                _set_nested_value(loaded[ns], key, op.get("value"))
-            elif op.get("op") == "delete":
-                _delete_nested_value(loaded[ns], key)
-            else:
-                raise ValueError(f"unknown state op {op.get('op')!r}")
-            counts[ns] = counts.get(ns, 0) + 1
-        for ns, data in loaded.items():
-            _save_state(ns, data)
+        try:
+            for op in ops:
+                if not isinstance(op, dict):
+                    raise ValueError("malformed state op")
+                ns = op.get("namespace")
+                key = op.get("key")
+                if not isinstance(ns, str) or not _is_safe_storage_name(ns):
+                    raise ValueError(f"invalid state namespace {ns!r}")
+                if not isinstance(key, str) or not key:
+                    raise ValueError(f"invalid state key {key!r}")
+                if ns not in loaded:
+                    current = _load_state(ns)
+                    if not isinstance(current, dict):
+                        raise ValueError(f"state file for namespace {ns!r} is not a JSON object")
+                    loaded[ns] = current
+                if op.get("op") == "set":
+                    _set_nested_value(loaded[ns], key, op.get("value"))
+                elif op.get("op") == "delete":
+                    _delete_nested_value(loaded[ns], key)
+                else:
+                    raise ValueError(f"unknown state op {op.get('op')!r}")
+                counts[ns] = counts.get(ns, 0) + 1
+        except (ValueError, OSError) as e:
+            raise StateCommitError(f"State commit failed, no state was written: {e}") from e
+
+        staged: List[Tuple[str, Path, Path]] = []
+        try:
+            for ns, data in loaded.items():
+                path = _get_state_path(ns)
+                staged.append((ns, _write_temp_json(path, data), path))
+        except Exception as e:
+            for _, tmp, _ in staged:
+                tmp.unlink(missing_ok=True)
+            raise StateCommitError(f"State commit failed, no state was written: {e}") from e
+
+        committed: List[str] = []
+        for i, (ns, tmp, path) in enumerate(staged):
+            try:
+                _replace_file(tmp, path)
+            except Exception as e:
+                for _, rest_tmp, _ in staged[i + 1:]:
+                    rest_tmp.unlink(missing_ok=True)
+                not_written = [n for n, _, _ in staged[i:]]
+                raise StateCommitError(
+                    "State commit partially failed: wrote "
+                    f"{', '.join(repr(n) for n in committed) or 'nothing'}; "
+                    f"not written: {', '.join(repr(n) for n in not_written)} ({e})"
+                ) from e
+            committed.append(ns)
         return counts
 
 
@@ -369,23 +444,31 @@ def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
     This enables skill composition - skills can invoke other skills during execution.
     """
     registry: Dict[str, Dict[str, Any]] = {}
+    enforce_deps = contracts.dependency_enforcement_mode() == contracts.ENFORCE_STRICT
     for name in SKILL_INDEX.all():
-        skill = _load_skill(name)
         # Skip malformed skill files so one bad file can't break composition.
-        if skill and isinstance(skill.get('code'), str):
+        try:
+            skill = _load_skill(name)
+            if not isinstance(skill, dict) or not isinstance(skill.get('code'), str):
+                continue
             schema = skill.get('parameters_schema')
+            deps = skill.get('dependencies')
             registry[name] = {
-                'name': skill['name'],
+                'name': name,
                 'code': skill['code'],
                 'description': skill.get('description', ''),
-                'version': skill.get('version', 1),
-                'dependencies': skill.get('dependencies') or [],
+                'version': _skill_version(skill),
+                'dependencies': deps if isinstance(deps, list) else [],
                 # Checked here (same interpreter as the child) so the child can refuse cheaply.
-                'missing_dependencies': contracts.missing_dependencies(skill.get('dependencies')),
+                'missing_dependencies': (
+                    contracts.missing_dependencies(deps) if enforce_deps else []
+                ),
                 'parameters_schema': schema,
                 # Legacy skills may carry a broken schema; the child skips enforcing those.
                 'schema_valid': contracts.check_schema(schema) is None,
             }
+        except Exception:
+            continue
     return registry
 
 
@@ -395,8 +478,11 @@ def _skill_dependents(name: str) -> List[str]:
     for other in SKILL_INDEX.all():
         if other == name:
             continue
-        skill = _load_skill(other)
-        code = skill.get('code') if skill else None
+        try:
+            skill = _load_skill(other)
+        except (OSError, ValueError):
+            continue  # unreadable file: can't tell, don't block the delete on it
+        code = skill.get('code') if isinstance(skill, dict) else None
         if isinstance(code, str) and name in contracts.find_skill_refs(code):
             dependents.append(other)
     return sorted(dependents)
@@ -404,8 +490,10 @@ def _skill_dependents(name: str) -> List[str]:
 
 def _contract_warnings(name: str, code: str, dependencies: List[str]) -> List[str]:
     """Non-fatal problems worth telling the author about at create/update time."""
-    warnings = []
-    missing = contracts.missing_dependencies(dependencies)
+    warnings: List[str] = []
+    report = contracts.check_dependencies(dependencies)
+    missing = report.missing
+    warnings.extend(f"Dependency ignored: {d}" for d in report.invalid)
     if missing:
         warnings.append(
             f"Unmet dependencies: {', '.join(missing)}. Invocations will be refused until "
@@ -466,50 +554,56 @@ async def create_skill(params: CreateSkillInput) -> str:
     Returns:
         str: Confirmation message with skill ID
     """
-    # Check if skill already exists
-    existing = _load_skill(params.name)
-    if existing:
-        return f"Error: Skill '{params.name}' already exists (ID: {existing['id']}). Use update_skill to modify."
+    with _skills_lock():
+        # Check if skill already exists
+        existing = _load_skill(params.name)
+        if existing:
+            return f"Error: Skill '{params.name}' already exists (ID: {existing['id']}). Use update_skill to modify."
 
-    # Create skill metadata
-    skill_data = {
-        "id": _generate_skill_id(params.name),
-        "name": params.name,
-        "description": params.description,
-        "code": params.code,
-        "category": params.category.value,
-        "tags": params.tags,
-        "dependencies": params.dependencies,
-        "parameters_schema": params.parameters_schema,
-        "examples": params.examples,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "version": 1,
-        "invocation_count": 0
-    }
+        # Create skill metadata
+        skill_data = {
+            "id": _generate_skill_id(params.name),
+            "name": params.name,
+            "description": params.description,
+            "code": params.code,
+            "category": params.category.value,
+            "tags": params.tags,
+            "dependencies": params.dependencies,
+            "parameters_schema": params.parameters_schema,
+            "examples": params.examples,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "version": 1,
+            "invocation_count": 0
+        }
 
-    # Validate code syntax
-    try:
-        compile(params.code, f"skill_{params.name}", 'exec')
-    except SyntaxError as e:
-        return f"Error: Invalid Python syntax in skill code: {e}"
+        # Validate code syntax
+        try:
+            compile(params.code, f"skill_{params.name}", 'exec')
+        except SyntaxError as e:
+            return f"Error: Invalid Python syntax in skill code: {e}"
 
-    # Validate contracts (bad schemas / requirement strings are author errors, reject them).
-    schema_error = contracts.check_schema(params.parameters_schema)
-    if schema_error:
-        return f"Error: {schema_error}"
-    dep_errors = contracts.invalid_dependencies(params.dependencies)
-    if dep_errors:
-        return "Error: " + "; ".join(dep_errors)
-    warnings = _contract_warnings(params.name, params.code, params.dependencies)
+        # Validate contracts (bad schemas / requirement strings are author errors, reject them).
+        schema_error = contracts.check_schema(params.parameters_schema)
+        if schema_error:
+            return f"Error: {schema_error}"
+        dep_errors = contracts.invalid_dependencies(params.dependencies)
+        if dep_errors:
+            return "Error: " + "; ".join(dep_errors)
+        warnings = _contract_warnings(params.name, params.code, params.dependencies)
 
-    # Save skill
-    _save_skill(skill_data)
-    SKILL_INDEX.upsert_from_skill(skill_data)
-    SKILL_VERSIONS.save(skill_data)
-    USAGE_TRACKER.ensure_minimums({params.name: 0})
+        # A skill file removed outside the tools can leave history and
+        # telemetry behind; a new skill with the same name must start clean.
+        SKILL_VERSIONS.remove_all(params.name)
+        TELEMETRY.clear(params.name)
 
-    return f"""✅ Skill created successfully!
+        # Save skill
+        _save_skill(skill_data)
+        SKILL_INDEX.upsert_from_skill(skill_data)
+        SKILL_VERSIONS.save(params.name, skill_data)
+        USAGE_TRACKER.ensure_minimums({params.name: 0})
+
+        return f"""✅ Skill created successfully!
 
 **Name:** {params.name}
 **ID:** {skill_data['id']}
@@ -554,7 +648,7 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
     if not skill:
         return f"Error: Skill '{params.skill_name}' not found. Use search_skills to find available skills."
 
-    version = int(skill.get('version', 1) or 1)
+    version = _skill_version(skill)
     warnings: List[str] = []
 
     def _reject(reason: str) -> str:
@@ -569,24 +663,33 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
         return f"Error: {reason}"
 
     # Contract 1: Python dependencies must be importable by the runner interpreter.
-    missing = contracts.missing_dependencies(skill.get('dependencies'))
-    if missing:
-        return _reject(
-            f"Skill '{params.skill_name}' has unmet dependencies: {', '.join(missing)}. "
-            f"{contracts.install_hint(missing)}"
-        )
+    dep_mode = contracts.dependency_enforcement_mode()
+    if dep_mode != contracts.ENFORCE_OFF:
+        report = contracts.check_dependencies(skill.get('dependencies'))
+        warnings.extend(f"Dependency ignored: {d}" for d in report.invalid)
+        if report.missing and dep_mode == contracts.ENFORCE_STRICT:
+            return _reject(
+                f"Skill '{params.skill_name}' has unmet dependencies: {', '.join(report.missing)}. "
+                f"{contracts.install_hint(report.missing)}"
+            )
+        warnings.extend(f"Unmet dependency: {d}" for d in report.missing)
 
     # Contract 2: parameters must satisfy the skill's parameters_schema.
     parameters: Dict[str, Any] = dict(params.parameters or {})
     schema = skill.get('parameters_schema')
     mode = contracts.schema_enforcement_mode()
-    if schema and mode != contracts.ENFORCE_OFF:
+    if schema is not None and mode != contracts.ENFORCE_OFF:
         schema_error = contracts.check_schema(schema)
+        errors: List[str] = []
+        if not schema_error:
+            parameters = contracts.apply_defaults(schema, parameters)
+            try:
+                errors = contracts.validate_params(schema, parameters)
+            except contracts.SchemaUsageError as e:
+                schema_error = f"schema could not be applied ({e})"
         if schema_error:
             warnings.append(f"Parameters not validated: {schema_error}. Fix it with update_skill.")
         else:
-            parameters = contracts.apply_defaults(schema, parameters)
-            errors = contracts.validate_params(schema, parameters)
             if errors and mode == contracts.ENFORCE_STRICT:
                 return _reject(
                     f"Invalid parameters for skill '{params.skill_name}':\n"
@@ -927,7 +1030,7 @@ __error__ = None
 try:
 {chr(10).join('    ' + line for line in code.split(chr(10)))}
 except Exception as e:
-    __error__ = str(e)
+    __error__ = str(e) or type(e).__name__
     import traceback
     __traceback__ = traceback.format_exc()
 """
@@ -1122,7 +1225,7 @@ def set_state(key, value, namespace='default'):
     import json as _json
     _state_check(key, namespace)
     try:
-        value = _json.loads(_json.dumps(value))
+        value = _json.loads(_json.dumps(value, allow_nan=False))
     except (TypeError, ValueError) as e:
         raise ValueError(f"State value for '{key}' is not JSON-serializable: {e}") from None
     op = {'op': 'set', 'namespace': namespace, 'key': key, 'value': value}
@@ -1188,20 +1291,43 @@ def _trace_call(skill_name, skill, status, started, error=None, pushed=True):
 
 
 def _check_skill_params(skill_name, skill, parameters):
-    """Fill schema defaults and enforce parameters_schema for a nested call."""
+    """Fill schema defaults and enforce parameters_schema for a nested call.
+
+    Without an enforceable schema the caller's object is passed through
+    unchanged (same object, any type), exactly as before contracts existed.
+    """
     schema = skill.get('parameters_schema')
     mode = globals().get('_schema_enforcement', 'strict')
-    params = dict(parameters or {})
-    if not schema or mode == 'off' or not skill.get('schema_valid', True):
+    params = parameters or {}
+    if (schema is None or schema is True or schema == {} or mode == 'off'
+            or not skill.get('schema_valid', True)):
         return params
-    for key, prop in (schema.get('properties') or {}).items():
-        if key not in params and isinstance(prop, dict) and 'default' in prop:
-            params[key] = prop['default']
-    import jsonschema as _jsonschema
-    errors = sorted(
-        _jsonschema.Draft202012Validator(schema).iter_errors(params),
-        key=lambda e: list(e.path),
-    )
+    if not isinstance(params, dict):
+        raise ValueError(
+            f"Invalid parameters for skill '{skill_name}': expected a dict, "
+            f"got {type(params).__name__}"
+        )
+    props = schema.get('properties') if isinstance(schema, dict) else None
+    if isinstance(props, dict):
+        missing_defaults = {
+            k: p['default'] for k, p in props.items()
+            if k not in params and isinstance(p, dict) and 'default' in p
+        }
+        if missing_defaults:
+            # Copy only when we add keys, so the caller's dict isn't mutated.
+            params = {**params, **missing_defaults}
+    import sys as _sys
+    try:
+        from jsonschema.validators import validator_for as _validator_for
+        from jsonschema import Draft202012Validator as _Draft202012Validator
+        cls = (_validator_for(schema, default=_Draft202012Validator)
+               if isinstance(schema, dict) else _Draft202012Validator)
+        errors = sorted(cls(schema).iter_errors(params), key=lambda e: list(e.path))
+    except Exception as e:
+        # The schema itself can't be applied (e.g. unresolvable $ref): don't block the call.
+        print(f"[warning] parameters for '{skill_name}' not validated: "
+              f"{type(e).__name__}: {e}", file=_sys.stderr)
+        return params
     if errors:
         msgs = []
         for e in errors[:10]:
@@ -1209,7 +1335,6 @@ def _check_skill_params(skill_name, skill, parameters):
             msgs.append(f"{where}: {e.message}" if where else e.message)
         if mode == 'strict':
             raise ValueError(f"Invalid parameters for skill '{skill_name}': " + '; '.join(msgs))
-        import sys as _sys
         print(f"[warning] parameters for '{skill_name}' violate its schema: " + '; '.join(msgs),
               file=_sys.stderr)
     return params
@@ -1328,17 +1453,11 @@ def invoke_skill(skill_name, parameters=None, context=None):
             '_skill_registry': skill_registry,
             '_skill_call_stack': skill_call_stack,
             '_max_skill_call_depth': max_call_depth,
-            'invoke_skill': invoke_skill,
-            'list_available_skills': list_available_skills,
-            'get_skill_info': get_skill_info,
-            'debug_context': debug_context,
-            'pretty_print': pretty_print,
-            # State bridge
-            'get_state': get_state,
-            'set_state': set_state,
-            'delete_state': delete_state,
-            'list_state_keys': list_state_keys,
         }
+        # Use the helper references captured by the runner, not whatever the
+        # calling skill's globals hold now: a skill that defines its own
+        # set_state/pretty_print must not hijack its children's helpers.
+        child_namespace.update(g.get('_helper_refs') or {})
 
         # Execute the skill code
         exec(skill_code, child_namespace)
@@ -1438,6 +1557,7 @@ def main():
     tb = None
     result = None
     exec_ms = None
+    exit_code = None
 
     try:
         # Execute common imports first
@@ -1465,6 +1585,14 @@ def main():
         # Now execute helper functions - they'll have access to the composition system
         helpers = payload.get("helpers", "")
         exec(helpers, namespace)
+        namespace["_helper_refs"] = {
+            name: namespace[name]
+            for name in (
+                "invoke_skill", "list_available_skills", "get_skill_info",
+                "debug_context", "pretty_print",
+                "get_state", "set_state", "delete_state", "list_state_keys",
+            )
+        }
 
         # Execute the actual code
         started = time.perf_counter()
@@ -1473,16 +1601,38 @@ def main():
         finally:
             exec_ms = (time.perf_counter() - started) * 1000.0
         result = namespace.get("__result__")
-    except Exception as e:
-        error = str(e)
+    except SystemExit as e:
+        # sys.exit()/exit() inside a skill: 0/None means "done", anything else is a failure.
+        result = namespace.get("__result__")
+        if e.code not in (0, None):
+            exit_code = e.code
+            error = f"Process exited with exit code {e.code} (sys.exit)"
+            error_type = "SystemExit"
+    except BaseException as e:
+        # str(e) is empty for e.g. a bare `assert` or `raise RuntimeError()`;
+        # fall back to the type name so the failure can never look like success.
+        error = str(e) or type(e).__name__
         error_type = type(e).__name__
         tb = traceback.format_exc()
+
+    # Serialize the result on its own so an unserializable value (tuple keys,
+    # cycles) degrades to its repr instead of losing the whole payload.
+    result_note = None
+    try:
+        json.dumps(result, default=str)
+    except Exception as e:
+        result_note = f"__result__ is not JSON-serializable ({type(e).__name__}: {e}); showing repr()"
+        try:
+            result = repr(result)
+        except Exception:
+            result = f"<unrepresentable {type(result).__name__}>"
 
     out = {
         "error": error,
         "error_type": error_type,
         "traceback": tb,
         "result": result,
+        "result_note": result_note,
         "exec_ms": exec_ms,
         # A failed run commits nothing, so don't ship its writes back.
         "state_ops": state_ops if error is None else [],
@@ -1491,10 +1641,24 @@ def main():
     }
     if result_path:
         try:
+            text = json.dumps(out, indent=2, default=str)
+        except Exception as e:
+            text = json.dumps({
+                "error": f"Failed to serialize execution result: {type(e).__name__}: {e}",
+                "error_type": "ResultSerializationError",
+                "traceback": None,
+                "result": None,
+                "state_ops": [],
+                "state_ops_discarded": len(state_ops),
+                "trace": [],
+            })
+        try:
             with open(result_path, "w", encoding="utf-8") as rf:
-                json.dump(out, rf, indent=2, default=str)
+                rf.write(text)
         except Exception:
             pass
+    if exit_code is not None:
+        sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
@@ -1544,7 +1708,9 @@ async def _run_code(
                 "result_path": str(result_path),
                 "common_imports": _COMMON_IMPORTS,
                 "helpers": _HELPER_FUNCTIONS,
-                "skill_registry": _build_skill_registry() if enable_composition else {},
+                "skill_registry": (
+                    await asyncio.to_thread(_build_skill_registry) if enable_composition else {}
+                ),
                 "max_call_depth": MAX_SKILL_CALL_DEPTH,
                 "current_skill_name": current_skill_name,
                 "state_dir": str(DEFAULT_STATE_DIR),
@@ -1616,6 +1782,7 @@ async def _run_code(
             state_ops: List[Dict[str, Any]] = []
             discarded = 0
             trace: List[Dict[str, Any]] = []
+            result_note: Optional[str] = None
             if result_path.exists():
                 try:
                     result_payload = json.loads(result_path.read_text(encoding="utf-8"))
@@ -1627,16 +1794,22 @@ async def _run_code(
                     state_ops = list(result_payload.get("state_ops") or [])
                     discarded = int(result_payload.get("state_ops_discarded") or 0)
                     trace = list(result_payload.get("trace") or [])
+                    result_note = result_payload.get("result_note")
                 except Exception:
                     error = "Failed to read execution result payload"
-
-            # The runner only catches Exception, so sys.exit() or a hard crash
-            # (os._exit, segfault, OOM kill) ends the child without a result.
-            if not timed_out and error is None and proc.returncode not in (0, None):
-                error = (
-                    f"Process terminated with exit code {proc.returncode} "
-                    "before reporting a result"
-                )
+                    error_type = "ResultPayloadError"
+            elif not timed_out:
+                # A hard exit (os._exit, segfault, OOM kill) ends the child
+                # before it reports. Even with exit code 0 that is not a
+                # clean run: its result and state writes are unknown.
+                if proc.returncode not in (0, None):
+                    error = (
+                        f"Process terminated with exit code {proc.returncode} "
+                        "before reporting a result"
+                    )
+                else:
+                    error = "Process exited without reporting a result"
+                error_type = "ProcessExit"
 
             # Commit buffered state writes only for a clean, completed run.
             state_note = ""
@@ -1650,8 +1823,11 @@ async def _run_code(
             elif state_ops:
                 try:
                     counts = _commit_state_ops(state_ops)
+                except StateCommitError as e:
+                    error = str(e)
+                    error_type = "StateCommitError"
                 except Exception as e:
-                    error = f"State commit failed, no state was written: {e}"
+                    error = f"State commit failed, no state was written: {type(e).__name__}: {e}"
                     error_type = "StateCommitError"
                 else:
                     state_writes = sum(counts.values())
@@ -1671,7 +1847,7 @@ async def _run_code(
                         f"after kill. PID may still be running."
                     )
 
-            if error:
+            if error is not None:
                 output_parts.append(_format_error_block(str(error), tb, context))
 
             if stdout_content:
@@ -1682,6 +1858,8 @@ async def _run_code(
 
             if result_obj is not None:
                 output_parts.append(_format_result_block(result_obj))
+            if result_note:
+                output_parts.append(f"**Note:** {result_note}")
 
             if state_note:
                 output_parts.append(state_note)
@@ -1692,7 +1870,7 @@ async def _run_code(
             if timed_out:
                 status = STATUS_TIMEOUT
                 error_summary: Optional[str] = f"Timed out after {timeout}s"
-            elif error:
+            elif error is not None:
                 status = STATUS_ERROR
                 error_summary = f"{error_type}: {error}" if error_type else str(error)
             else:
@@ -1887,7 +2065,8 @@ async def get_skill(name: str, version: Optional[int] = None) -> str:
         return f"Error: Skill '{name}' not found. Use search_skills to find available skills."
 
     skill = current
-    if version is not None and version != current.get('version', 1):
+    current_version = _skill_version(current)
+    if version is not None and version != current_version:
         snapshot = SKILL_VERSIONS.get(name, version)
         if snapshot is None:
             available = ", ".join(f"v{v}" for v in SKILL_VERSIONS.versions(name)) or "none"
@@ -1896,8 +2075,8 @@ async def get_skill(name: str, version: Optional[int] = None) -> str:
 
     # Overlay authoritative usage count.
     skill["invocation_count"] = USAGE_TRACKER.get(name)
-    shown_version = skill.get('version', 1)
-    is_current = shown_version == current.get('version', 1)
+    shown_version = _skill_version(skill)
+    is_current = skill is current
 
     lines = [
         f"# Skill: {skill['name']}" + ("" if is_current else f" (historical v{shown_version})"),
@@ -1906,7 +2085,7 @@ async def get_skill(name: str, version: Optional[int] = None) -> str:
         f"- **ID:** {skill.get('id', 'unknown')}",
         f"- **Category:** {skill.get('category', 'custom')}",
         f"- **Version:** {shown_version}"
-        + ("" if is_current else f" (current is v{current.get('version', 1)})"),
+        + ("" if is_current else f" (current is v{current_version})"),
         f"- **Tags:** {', '.join(skill.get('tags', [])) or 'None'}",
         f"- **Dependencies:** {', '.join(skill.get('dependencies', [])) or 'None'}",
         f"- **Created:** {skill.get('created_at', 'unknown')}",
@@ -1993,83 +2172,89 @@ async def update_skill(
     Returns:
         str: Confirmation of update
     """
-    skill = _load_skill(name)
-    if not skill:
-        return f"Error: Skill '{name}' not found."
+    with _skills_lock():
+        skill = _load_skill(name)
+        if not skill:
+            return f"Error: Skill '{name}' not found."
 
-    current_version = int(skill.get('version', 1) or 1)
-    if expected_version is not None and expected_version != current_version:
-        return (
-            f"Error: Version conflict for '{name}': expected v{expected_version} but it is at "
-            f"v{current_version}. Reload it with get_skill and reapply your change."
+        current_version = _skill_version(skill)
+        if expected_version is not None and expected_version != current_version:
+            return (
+                f"Error: Version conflict for '{name}': expected v{expected_version} but it is at "
+                f"v{current_version}. Reload it with get_skill and reapply your change."
+            )
+
+        # Trust the file name we looked up, not a hand-edited `name` field inside it.
+        updated = {**skill, 'name': name}
+
+        # Validate and apply fields
+        if code is not None:
+            try:
+                compile(code, f"skill_{name}", 'exec')
+            except SyntaxError as e:
+                return f"Error: Invalid Python syntax: {e}"
+            updated['code'] = code
+
+        if description is not None:
+            updated['description'] = description
+
+        if tags is not None:
+            updated['tags'] = tags
+
+        if dependencies is not None:
+            dep_errors = contracts.invalid_dependencies(dependencies)
+            if dep_errors:
+                return "Error: " + "; ".join(dep_errors)
+            updated['dependencies'] = dependencies
+
+        if parameters_schema is not None:
+            schema_error = contracts.check_schema(parameters_schema)
+            if schema_error:
+                return f"Error: {schema_error}"
+            updated['parameters_schema'] = parameters_schema or None
+
+        if category is not None:
+            try:
+                updated['category'] = SkillCategory(category).value
+            except ValueError:
+                valid = ", ".join(c.value for c in SkillCategory)
+                return f"Error: Unknown category '{category}'. Valid categories: {valid}."
+
+        if examples is not None:
+            updated['examples'] = examples
+
+        if all(updated.get(f) == skill.get(f) for f in CONTENT_FIELDS):
+            return f"No changes: skill '{name}' is unchanged at version {current_version}."
+
+        # Keep the pre-edit content restorable even for skills created before
+        # version history existed.
+        SKILL_VERSIONS.ensure_snapshot(name, skill)
+
+        # Update metadata
+        updated['updated_at'] = datetime.now(timezone.utc).isoformat()
+        updated['version'] = current_version + 1
+        updated.pop('rolled_back_from', None)
+        if change_note:
+            updated['change_note'] = change_note
+        else:
+            updated.pop('change_note', None)
+
+        _save_skill(updated)
+        SKILL_INDEX.upsert_from_skill(updated)
+        SKILL_VERSIONS.save(name, updated)
+
+        warnings = _contract_warnings(
+            name, str(updated.get('code', '')), list(updated.get('dependencies') or [])
         )
-
-    updated = dict(skill)
-
-    # Validate and apply fields
-    if code is not None:
-        try:
-            compile(code, f"skill_{name}", 'exec')
-        except SyntaxError as e:
-            return f"Error: Invalid Python syntax: {e}"
-        updated['code'] = code
-
-    if description is not None:
-        updated['description'] = description
-
-    if tags is not None:
-        updated['tags'] = tags
-
-    if dependencies is not None:
-        dep_errors = contracts.invalid_dependencies(dependencies)
-        if dep_errors:
-            return "Error: " + "; ".join(dep_errors)
-        updated['dependencies'] = dependencies
-
-    if parameters_schema is not None:
-        schema_error = contracts.check_schema(parameters_schema)
-        if schema_error:
-            return f"Error: {schema_error}"
-        updated['parameters_schema'] = parameters_schema or None
-
-    if category is not None:
-        try:
-            updated['category'] = SkillCategory(category).value
-        except ValueError:
-            valid = ", ".join(c.value for c in SkillCategory)
-            return f"Error: Unknown category '{category}'. Valid categories: {valid}."
-
-    if examples is not None:
-        updated['examples'] = examples
-
-    if all(updated.get(f) == skill.get(f) for f in CONTENT_FIELDS):
-        return f"No changes: skill '{name}' is unchanged at version {current_version}."
-
-    # Keep the pre-edit content restorable even for skills created before
-    # version history existed.
-    SKILL_VERSIONS.ensure_snapshot(skill)
-
-    # Update metadata
-    updated['updated_at'] = datetime.now(timezone.utc).isoformat()
-    updated['version'] = current_version + 1
-    updated.pop('rolled_back_from', None)
-    if change_note:
-        updated['change_note'] = change_note
-    else:
-        updated.pop('change_note', None)
-
-    _save_skill(updated)
-    SKILL_INDEX.upsert_from_skill(updated)
-    SKILL_VERSIONS.save(updated)
-
-    warnings = _contract_warnings(
-        name, str(updated.get('code', '')), list(updated.get('dependencies') or [])
-    )
-    return (
-        f"✅ Skill '{name}' updated to version {updated['version']}. "
-        f"Undo with rollback_skill(name='{name}', version={current_version})."
-        f"{_format_warnings(warnings)}"
-    )
+        undo = (
+            f" Undo with rollback_skill(name='{name}', version={current_version})."
+            if current_version in SKILL_VERSIONS.versions(name)
+            else ""
+        )
+        return (
+            f"✅ Skill '{name}' updated to version {updated['version']}.{undo}"
+            f"{_format_warnings(warnings)}"
+        )
 
 
 @mcp.tool(
@@ -2097,32 +2282,33 @@ async def delete_skill(name: str, confirm: bool = False, force: bool = False) ->
     Returns:
         str: Confirmation or error message
     """
-    if not confirm:
-        return f"⚠️ To delete skill '{name}', call delete_skill with confirm=True"
+    with _skills_lock():
+        if not confirm:
+            return f"⚠️ To delete skill '{name}', call delete_skill with confirm=True"
 
-    if not _is_safe_storage_name(name):
-        return f"Error: Invalid skill name '{name}'."
+        if not _is_safe_storage_name(name):
+            return f"Error: Invalid skill name '{name}'."
 
-    path = _get_skill_path(name)
-    if not path.exists():
-        return f"Error: Skill '{name}' not found."
+        path = _get_skill_path(name)
+        if not path.exists():
+            return f"Error: Skill '{name}' not found."
 
-    dependents = _skill_dependents(name)
-    if dependents and not force:
-        return (
-            f"Error: Skill '{name}' is called by: {', '.join(dependents)}. Deleting it would "
-            "break them. Update those skills first, or pass force=True to delete anyway."
-        )
+        dependents = _skill_dependents(name)
+        if dependents and not force:
+            return (
+                f"Error: Skill '{name}' is called by: {', '.join(dependents)}. Deleting it would "
+                "break them. Update those skills first, or pass force=True to delete anyway."
+            )
 
-    path.unlink()
-    SKILL_INDEX.remove(name)
-    USAGE_TRACKER.remove(name)
-    SKILL_VERSIONS.remove_all(name)
-    TELEMETRY.clear(name)
-    msg = f"✅ Skill '{name}' has been permanently deleted."
-    if dependents:
-        msg += f"\n\n**Warning:** these skills still call it and will fail: {', '.join(dependents)}"
-    return msg
+        path.unlink()
+        SKILL_INDEX.remove(name)
+        USAGE_TRACKER.remove(name)
+        SKILL_VERSIONS.remove_all(name)
+        TELEMETRY.clear(name)
+        msg = f"✅ Skill '{name}' has been permanently deleted."
+        if dependents:
+            msg += f"\n\n**Warning:** these skills still call it and will fail: {', '.join(dependents)}"
+        return msg
 
 
 # =============================================================================
@@ -2159,7 +2345,7 @@ async def list_skill_versions(
     if not skill:
         return f"Error: Skill '{name}' not found."
 
-    current_version = int(skill.get('version', 1) or 1)
+    current_version = _skill_version(skill)
     history = SKILL_VERSIONS.history(name)
     if not any(h["version"] == current_version for h in history):
         # Legacy skill without a snapshot of its current version.
@@ -2206,7 +2392,7 @@ async def list_skill_versions(
             f"| {s.get('runs', 0)} "
             f"| {_fmt_rate(s.get('failure_rate'))} "
             f"| {_fmt_ms(s.get('p50_ms'))} "
-            f"| {note} |"
+            f"| {_md_cell(note)} |"
         )
     lines.append("\nUse diff_skill_versions to compare and rollback_skill to restore a version.")
     return "\n".join(lines)
@@ -2238,7 +2424,7 @@ async def diff_skill_versions(
     skill = _load_skill(name)
     if not skill:
         return f"Error: Skill '{name}' not found."
-    current_version = int(skill.get('version', 1) or 1)
+    current_version = _skill_version(skill)
     target = to_version if to_version is not None else current_version
 
     def _resolve(v: int) -> Optional[Dict[str, Any]]:
@@ -2281,48 +2467,54 @@ async def rollback_skill(name: str, version: int, expected_version: Optional[int
     Returns:
         str: Confirmation with the new version number
     """
-    skill = _load_skill(name)
-    if not skill:
-        return f"Error: Skill '{name}' not found."
-    current_version = int(skill.get('version', 1) or 1)
-    if expected_version is not None and expected_version != current_version:
+    with _skills_lock():
+        skill = _load_skill(name)
+        if not skill:
+            return f"Error: Skill '{name}' not found."
+        current_version = _skill_version(skill)
+        if expected_version is not None and expected_version != current_version:
+            return (
+                f"Error: Version conflict for '{name}': expected v{expected_version} but it is at "
+                f"v{current_version}."
+            )
+        if version == current_version:
+            return f"No changes: skill '{name}' is already at version {version}."
+
+        target = SKILL_VERSIONS.get(name, version)
+        if target is None:
+            available = ", ".join(f"v{v}" for v in SKILL_VERSIONS.versions(name)) or "none"
+            return f"Error: Skill '{name}' has no stored version {version}. Available: {available}."
+
+        SKILL_VERSIONS.ensure_snapshot(name, skill)
+
+        restored = {**skill, 'name': name}
+        for f in CONTENT_FIELDS:
+            if f in target:
+                restored[f] = copy.deepcopy(target[f])
+            else:
+                restored.pop(f, None)
+        restored['version'] = current_version + 1
+        restored['updated_at'] = datetime.now(timezone.utc).isoformat()
+        restored['rolled_back_from'] = version
+        restored['change_note'] = f"Rollback to v{version}"
+
+        _save_skill(restored)
+        SKILL_INDEX.upsert_from_skill(restored)
+        SKILL_VERSIONS.save(name, restored)
         return (
-            f"Error: Version conflict for '{name}': expected v{expected_version} but it is at "
-            f"v{current_version}."
+            f"✅ Skill '{name}' rolled back to the content of v{version}, saved as "
+            f"version {restored['version']}."
         )
-    if version == current_version:
-        return f"No changes: skill '{name}' is already at version {version}."
-
-    target = SKILL_VERSIONS.get(name, version)
-    if target is None:
-        available = ", ".join(f"v{v}" for v in SKILL_VERSIONS.versions(name)) or "none"
-        return f"Error: Skill '{name}' has no stored version {version}. Available: {available}."
-
-    SKILL_VERSIONS.ensure_snapshot(skill)
-
-    restored = dict(skill)
-    for f in CONTENT_FIELDS:
-        if f in target:
-            restored[f] = copy.deepcopy(target[f])
-        else:
-            restored.pop(f, None)
-    restored['version'] = current_version + 1
-    restored['updated_at'] = datetime.now(timezone.utc).isoformat()
-    restored['rolled_back_from'] = version
-    restored['change_note'] = f"Rollback to v{version}"
-
-    _save_skill(restored)
-    SKILL_INDEX.upsert_from_skill(restored)
-    SKILL_VERSIONS.save(restored)
-    return (
-        f"✅ Skill '{name}' rolled back to the content of v{version}, saved as "
-        f"version {restored['version']}."
-    )
 
 
 # =============================================================================
 # Telemetry Tools
 # =============================================================================
+
+def _md_cell(value: Any) -> str:
+    """Make text safe inside a markdown table cell."""
+    return " ".join(str(value).split()).replace("|", "\\|") if value else ""
+
 
 def _fmt_rate(rate: Any) -> str:
     return f"{rate * 100:.1f}%" if isinstance(rate, (int, float)) else "–"
@@ -2396,7 +2588,7 @@ async def get_skill_stats(
         ]
         for name, s in rows:
             lines.append(
-                f"| {name} | {s['runs']} | {_fmt_rate(s['success_rate'])} | {s['error']} "
+                f"| {_md_cell(name)} | {s['runs']} | {_fmt_rate(s['success_rate'])} | {s['error']} "
                 f"| {s['timeout']} | {s['rejected']} | {_fmt_ms(s['p50_ms'])} "
                 f"| {_fmt_ms(s['p95_ms'])} | {str(s['last_run_at'] or '')[:19]} |"
             )
@@ -2432,7 +2624,7 @@ async def get_skill_stats(
     for v, s in stats["by_version"].items():
         lines.append(
             f"| v{v} | {s['runs']} | {_fmt_rate(s['success_rate'])} | {_fmt_ms(s['p50_ms'])} "
-            f"| {_fmt_ms(s['p95_ms'])} | {s['last_error'] or ''} |"
+            f"| {_fmt_ms(s['p95_ms'])} | {_md_cell(s['last_error'])} |"
         )
     if runs:
         lines += ["", f"### Last {len(runs)} run(s)"]
@@ -2483,7 +2675,7 @@ async def set_state(params: StateInput) -> str:
     if not _is_safe_storage_name(params.namespace):
         return _invalid_namespace_message(params.namespace)
 
-    with _STATE_LOCK:
+    with _state_lock():
         state = _load_state(params.namespace)
         try:
             _set_nested_value(state, params.key, params.value)
@@ -2517,7 +2709,7 @@ async def delete_state(key: str, namespace: str = "default") -> str:
     if not _is_safe_storage_name(namespace):
         return _invalid_namespace_message(namespace)
 
-    with _STATE_LOCK:
+    with _state_lock():
         state = _load_state(namespace)
         existed = _delete_nested_value(state, key)
         if existed:
@@ -2793,7 +2985,7 @@ async def get_orchestrator_status() -> str:
         recorded = sum(s["runs"] for s in overview.values())
         failing = sorted(
             n for n, s in overview.items()
-            if s.get("last_error_at") and s.get("last_error_at") == s.get("last_run_at")
+            if s.get("last_status") not in (None, STATUS_OK)
         )
         telemetry_lines = (
             f"- **Recorded Executions:** {recorded}\n"

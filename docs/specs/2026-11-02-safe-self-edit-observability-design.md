@@ -51,11 +51,24 @@ Agents can create and rewrite skills, but nothing protects them when they do:
 - A nested `invoke_skill` that raises has its ops truncated (and the read cache cleared) before the exception propagates. A parent that catches the error therefore keeps its own writes but not the child's.
 - The MCP state tools now also take the state lock and write atomically, and a `delete_state` tool was added for parity.
 
+## Hardening after review
+
+A bug-hunt review reproduced the following problems; each is fixed and covered by `tests/test_review_regressions.py`.
+
+- **Run status:** an exception with an empty message (bare `assert`) was recorded as `ok`. `sys.exit(0)` silently dropped state writes, and `os._exit(0)` looked like success. An unserializable `__result__` lost the whole result payload, including the state ops. The runner now catches `BaseException`, treats `SystemExit(0/None)` as a clean finish, falls back to the exception type as the message, and degrades an unserializable result to its `repr()`.
+- **Composition compatibility:** nested calls once again pass the caller's `parameters` object through unchanged (any type, same object) unless a schema needs defaults filled. Children get the helper functions captured by the runner, so a parent that defines its own `set_state` can't hijack them.
+- **Cross-process safety:** each MCP client runs its own server process. State commits, the state tools, skill create/update/rollback/delete and telemetry appends/compaction now take an OS-level file lock (`locking.py`, `fcntl`/`msvcrt`), so `expected_version` and the state merge hold across processes. A state commit stages every namespace file before replacing any, and its message says exactly what was written.
+- **Legacy data:** malformed `dependencies` values (`null`, numbers, a bare string), free-form dependency notes, string versions (`"1.0"`), boolean schemas and schemas with unresolvable `$ref`s no longer crash an invocation or break unrelated skills. Free-form dependencies become warnings, and `SKILL_ORCHESTRATOR_DEPENDENCY_ENFORCEMENT` adds a switch.
+- **Safety:** dependency checks never import a package (a dotted name used to run its parent package's code inside the server, which could write to the stdio stream). Snapshot paths come from the validated skill name, never from the `name` field inside a file. A skill created over leftover history starts clean. `NaN` can't be written to state.
+- **Telemetry:** "last run" and recent-run order use timestamps, not file order, since nested records are written when the parent finishes. `record()` never raises, and `|` in errors no longer breaks the markdown tables.
+- **Performance:** dependency, schema and skill-reference checks are cached, and the registry is built off the event loop. With 200 skills, building the registry takes about 6 ms (it took about 144 ms before the fix, and about 5 ms before this change).
+
 ## Behavior changes
 
 - `delete_skill` on a skill that other skills call needs `force=True`.
 - `invoke_skill` refuses skills with unmet dependencies or invalid parameters (in `strict` mode) instead of running them.
 - The `invoke_skill` header now includes the version: `## Skill Execution: name (v3)`.
+- `sys.exit(0)` inside a skill is now a clean finish (its state writes commit). Before, the run ended without a result.
 
 ## Not covered
 

@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from .locking import file_lock
+
 DEFAULT_TELEMETRY_FILENAME = "executions.jsonl"
 DEFAULT_MAX_RECORDS = 10_000
 MAX_ERROR_CHARS = 500
@@ -74,6 +76,7 @@ class _Bucket:
     last_run_at: Optional[str] = None
     last_error: Optional[str] = None
     last_error_at: Optional[str] = None
+    last_status: Optional[str] = None
 
     def add(self, rec: Dict[str, Any]) -> None:
         self.runs += 1
@@ -89,10 +92,14 @@ class _Bucket:
         duration = rec.get("duration_ms")
         if isinstance(duration, (int, float)) and status != STATUS_REJECTED:
             self.durations.append(float(duration))
+        # Records aren't strictly in time order (nested calls are written when
+        # their parent finishes), so compare timestamps instead of file order.
         ts = rec.get("ts")
         if isinstance(ts, str):
-            self.last_run_at = ts
-            if status != STATUS_OK:
+            if self.last_run_at is None or ts >= self.last_run_at:
+                self.last_run_at = ts
+                self.last_status = status
+            if status != STATUS_OK and (self.last_error_at is None or ts >= self.last_error_at):
                 self.last_error = rec.get("error") or status
                 self.last_error_at = ts
 
@@ -113,6 +120,7 @@ class _Bucket:
             "p95_ms": _percentile(durations, 95),
             "max_ms": durations[-1] if durations else None,
             "last_run_at": self.last_run_at,
+            "last_status": self.last_status,
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
         }
@@ -131,6 +139,8 @@ class ExecutionTelemetry:
     ) -> None:
         self._path = telemetry_dir / filename
         self._lock = threading.Lock()
+        # Several server processes may share one log; compaction must not race appends.
+        self._file_lock_path = telemetry_dir / f".{filename}.lock"
         self._max_records = max(1, int(max_records))
         self._enabled = enabled
         self._line_count: Optional[int] = None
@@ -163,25 +173,25 @@ class ExecutionTelemetry:
         """Append one execution record. Never raises: telemetry must not break runs."""
         if not self._enabled:
             return None
-        rec: Dict[str, Any] = {
-            "ts": ts or utc_now_iso(),
-            "kind": kind,
-            "skill": skill_name,
-            "version": skill_version,
-            "status": status,
-            "duration_ms": round(float(duration_ms), 1),
-        }
-        if exec_ms is not None:
-            rec["exec_ms"] = round(float(exec_ms), 1)
-        if error:
-            rec["error"] = _truncate(error)
-        if parent is not None:
-            rec["parent"] = parent
-        if depth is not None:
-            rec["depth"] = depth
-        if state_writes:
-            rec["state_writes"] = state_writes
         try:
+            rec: Dict[str, Any] = {
+                "ts": ts or utc_now_iso(),
+                "kind": kind,
+                "skill": skill_name,
+                "version": skill_version,
+                "status": status,
+                "duration_ms": round(float(duration_ms), 1),
+            }
+            if exec_ms is not None:
+                rec["exec_ms"] = round(float(exec_ms), 1)
+            if error:
+                rec["error"] = _truncate(error)
+            if parent is not None:
+                rec["parent"] = parent
+            if depth is not None:
+                rec["depth"] = depth
+            if state_writes:
+                rec["state_writes"] = state_writes
             self._append([rec])
         except Exception:
             return None
@@ -200,7 +210,7 @@ class ExecutionTelemetry:
 
     def clear(self, skill_name: Optional[str] = None) -> int:
         """Drop records (all, or for one skill). Returns the number removed."""
-        with self._lock:
+        with self._lock, file_lock(self._file_lock_path):
             records = self._read_locked()
             if skill_name is None:
                 kept: List[Dict[str, Any]] = []
@@ -233,9 +243,12 @@ class ExecutionTelemetry:
         return out
 
     def recent(self, *, skill_name: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
-        """Newest-first slice of records."""
+        """Newest-first slice of records (by timestamp, not file order)."""
+        if limit <= 0:
+            return []
         recs = self.records(skill_name=skill_name)
-        return list(reversed(recs[-limit:])) if limit > 0 else []
+        recs.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+        return recs[:limit]
 
     def skill_stats(self, skill_name: str) -> Dict[str, Any]:
         """Aggregate stats for one skill, overall and per version."""
@@ -294,16 +307,20 @@ class ExecutionTelemetry:
         return out
 
     def _append(self, recs: List[Dict[str, Any]]) -> None:
-        with self._lock:
+        payload = "".join(json.dumps(rec, default=str) + "\n" for rec in recs)
+        with self._lock, file_lock(self._file_lock_path):
             self._path.parent.mkdir(parents=True, exist_ok=True)
             if self._line_count is None:
-                self._read_locked()
+                self._read_locked()  # count what's already there once
             with self._path.open("a", encoding="utf-8") as f:
-                for rec in recs:
-                    f.write(json.dumps(rec, default=str) + "\n")
+                f.write(payload)
+            # Other processes append too, so recount instead of trusting a cached
+            # count; only do the (cheap) size check every so often.
             self._line_count = (self._line_count or 0) + len(recs)
             if self._line_count > int(self._max_records * 1.25):
-                self._rewrite_locked(self._read_locked()[-self._max_records :])
+                records = self._read_locked()
+                if len(records) > int(self._max_records * 1.25):
+                    self._rewrite_locked(records[-self._max_records :])
 
     def _rewrite_locked(self, records: List[Dict[str, Any]]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

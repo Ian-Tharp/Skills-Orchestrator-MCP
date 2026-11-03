@@ -40,6 +40,22 @@ CONTENT_FIELDS = (
 _VERSION_FILE_RE = re.compile(r"^v(\d+)\.json$")
 
 
+def _is_safe_name(name: str) -> bool:
+    return (
+        bool(name)
+        and not name.startswith(".")
+        and not any(c in name for c in ("/", "\\", ":", "\x00"))
+    )
+
+
+def _as_version(raw: Any) -> int:
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return 1
+    return v if v >= 1 else 1
+
+
 def code_digest(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()[:12]
 
@@ -78,28 +94,35 @@ class SkillVersionStore:
         return self._root
 
     def _dir(self, name: str) -> Path:
+        # `name` becomes a directory name: never let it escape the versions root.
+        if not _is_safe_name(name):
+            raise ValueError(f"Invalid skill name: {name!r}")
         return self._root / name
 
-    def save(self, skill: Mapping[str, Any]) -> None:
-        """Snapshot a skill at its current ``version``, then prune old snapshots."""
-        name = str(skill["name"])
-        version = int(skill.get("version", 1) or 1)
+    def save(self, name: str, skill: Mapping[str, Any]) -> None:
+        """Snapshot a skill at its current ``version``, then prune old snapshots.
+
+        `name` is the validated skill name the caller looked up, not the
+        (possibly hand-edited) ``name`` field inside the file.
+        """
+        version = _as_version(skill.get("version", 1))
         with self._lock:
-            _atomic_write_json(self._dir(name) / f"v{version}.json", dict(skill))
+            _atomic_write_json(self._dir(name) / f"v{version}.json", {**skill, "name": name})
             self._prune_locked(name)
 
-    def ensure_snapshot(self, skill: Mapping[str, Any]) -> None:
+    def ensure_snapshot(self, name: str, skill: Mapping[str, Any]) -> None:
         """Snapshot a skill only if its current version has no snapshot yet.
 
         Skills created before version history existed have none; this captures
         their current content before the first edit so it can be rolled back to.
         """
-        name = str(skill["name"])
-        version = int(skill.get("version", 1) or 1)
+        version = _as_version(skill.get("version", 1))
         if not (self._dir(name) / f"v{version}.json").exists():
-            self.save(skill)
+            self.save(name, skill)
 
     def versions(self, name: str) -> List[int]:
+        if not _is_safe_name(name):
+            return []
         d = self._dir(name)
         if not d.is_dir():
             return []
@@ -111,6 +134,8 @@ class SkillVersionStore:
         return sorted(out)
 
     def get(self, name: str, version: int) -> Optional[Dict[str, Any]]:
+        if not _is_safe_name(name):
+            return None
         path = self._dir(name) / f"v{int(version)}.json"
         if not path.exists():
             return None
@@ -141,6 +166,8 @@ class SkillVersionStore:
         return out
 
     def remove_all(self, name: str) -> None:
+        if not _is_safe_name(name):
+            return
         with self._lock:
             shutil.rmtree(self._dir(name), ignore_errors=True)
 
