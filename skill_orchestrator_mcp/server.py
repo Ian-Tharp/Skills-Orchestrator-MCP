@@ -1524,12 +1524,10 @@ def invoke_skill(skill_name, parameters=None, context=None):
             error = f"{type(e).__name__}: {e}"
         except Exception:
             error = type(e).__name__
-        if isinstance(e, SystemExit):
-            # sys.exit() in a child ends the child, not the whole run: surface it
-            # to the caller as an ordinary exception it can handle.
-            raise RuntimeError(
-                f"Skill '{skill_name}' called sys.exit({e.code!r})"
-            ) from None
+        if isinstance(e, SystemExit) and not hasattr(e, '_from_nested_skill'):
+            # Mark it: a caller may still catch it (`except SystemExit`), but if
+            # it reaches the top level the run failed, it did not "finish".
+            e._from_nested_skill = skill_name
         raise
 
     finally:
@@ -1658,7 +1656,13 @@ def main():
     except SystemExit as e:
         # sys.exit()/exit() inside a skill: 0/None means "done", anything else is a failure.
         result = namespace.get("__result__")
-        if e.code not in (0, None):
+        nested = getattr(e, "_from_nested_skill", None)
+        if nested is not None:
+            # An uncaught sys.exit() from a nested skill cut the caller short.
+            error = f"Skill '{nested}' called sys.exit({e.code!r})"
+            error_type = "SystemExit"
+            tb = traceback.format_exc()
+        elif e.code not in (0, None):
             exit_code = e.code if isinstance(e.code, int) else 1
             if isinstance(e.code, int):
                 error = f"Process exited with exit code {e.code} (sys.exit)"

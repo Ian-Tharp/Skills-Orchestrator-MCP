@@ -342,8 +342,9 @@ How writes behave:
   process) are preserved. Last writer wins per key.
 - `sys.exit(0)` in the top-level skill ends the run cleanly (writes are
   committed); any other exit code, an exception or a timeout discards them.
-  In a nested skill, `sys.exit()` ends only that child: the caller gets a
-  `RuntimeError` it can catch, and the child's writes are rolled back.
+  In a nested skill, `sys.exit()` rolls back that child's writes; the caller
+  can catch the `SystemExit`, and if nothing does, the whole run fails (it
+  is not treated as a clean finish).
 - Values must be strict JSON (checked at `set_state` time; `NaN` and
   `Infinity` are rejected). Namespaces follow the same rules as the tools (no
   path separators, no leading dot).

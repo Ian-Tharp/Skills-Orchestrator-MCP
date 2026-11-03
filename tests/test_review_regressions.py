@@ -498,21 +498,24 @@ async def test_create_refuses_to_overwrite_empty_skill_file(storage: Storage) ->
 
 async def test_nested_sys_exit_is_an_error_for_the_caller(storage: Storage) -> None:
     await _create("child_exit", "set_state('c', 1)\nimport sys\nsys.exit(0)")
+    # A caller can still catch the child's exit, as before contracts existed...
     await _create(
         "parent_of_exit",
         "set_state('p', 1)\n"
-        "try:\n    invoke_skill('child_exit')\nexcept RuntimeError as e:\n    set_state('caught', str(e))\n"
+        "try:\n    invoke_skill('child_exit')\nexcept SystemExit as e:\n    set_state('caught', e.code)\n"
         "set_state('after', 1)",
     )
+    # ...but if nobody catches it, the cut-off parent must not commit as "ok".
     await _create("parent_uncaught", "set_state('p2', 1)\ninvoke_skill('child_exit')\nset_state('after2', 1)")
 
     caught = await _invoke("parent_of_exit")
     uncaught = await _invoke("parent_uncaught")
 
-    state = _state(storage)
-    assert state == {"p": 1, "caught": "Skill 'child_exit' called sys.exit(0)", "after": 1}
-    assert "called sys.exit(0)" in uncaught and "discarded" in uncaught
+    assert _state(storage) == {"p": 1, "caught": 0, "after": 1}
     assert "committed" in caught
+    assert "Skill 'child_exit' called sys.exit(0)" in uncaught and "discarded" in uncaught
+    (rec,) = server.TELEMETRY.records(skill_name="parent_uncaught")
+    assert rec["status"] == "error"
 
 
 async def test_parent_invoke_skill_wrapper_reaches_grandchildren(storage: Storage) -> None:
@@ -607,3 +610,19 @@ def test_lock_falls_back_when_locking_is_unsupported(tmp_path: Path, monkeypatch
     monkeypatch.setattr(locking, "_try_lock", unsupported)
     with locking.file_lock(tmp_path / "x.lock", timeout=0.5):
         pass  # no 30 s wait, no exception
+
+
+def test_aliased_stdlib_submodules_count_as_installed() -> None:
+    contracts._dep_cache.clear()
+    assert contracts.missing_dependencies(["os.path", "collections.abc"]) == []
+
+
+def test_unresolvable_dynamic_ref_rejected_at_create() -> None:
+    bad = {"type": "object", "properties": {"k": {"$dynamicRef": "#nope"}}}
+    good = {
+        "type": "object",
+        "$defs": {"n": {"$dynamicAnchor": "node", "type": "integer"}},
+        "properties": {"k": {"$dynamicRef": "#node"}},
+    }
+    assert "does not resolve" in (contracts.check_schema(bad) or "")
+    assert contracts.check_schema(good) is None

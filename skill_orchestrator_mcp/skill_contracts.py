@@ -34,6 +34,7 @@ import json
 import os
 import platform
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -202,6 +203,17 @@ def _is_importable(module: str) -> bool:
     parts = module.replace("-", "_").split(".")
     if not all(p.isidentifier() for p in parts):
         return False
+    full = ".".join(parts)
+    if full in sys.modules:
+        return True  # already loaded (covers aliases such as os.path, collections.abc)
+    try:
+        if (
+            importlib.machinery.BuiltinImporter.find_spec(full) is not None
+            or importlib.machinery.FrozenImporter.find_spec(full) is not None
+        ):
+            return True
+    except (ImportError, ValueError):
+        pass
     try:
         spec = importlib.util.find_spec(parts[0])
         for i in range(1, len(parts)):
@@ -244,11 +256,16 @@ def _unresolvable_refs(schema: Mapping[str, Any]) -> List[str]:
 
     def walk(resource: Resource[Any], res: Any) -> None:
         contents = resource.contents
-        if isinstance(contents, dict) and isinstance(contents.get("$ref"), str):
-            try:
-                res.lookup(contents["$ref"])
-            except Unresolvable:
-                bad.append(contents["$ref"])
+        if isinstance(contents, dict):
+            # $dynamicRef / $recursiveRef (2020-12 / 2019-09) resolve to an
+            # ordinary anchor/pointer when looked up statically.
+            for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
+                ref = contents.get(keyword)
+                if isinstance(ref, str):
+                    try:
+                        res.lookup(ref)
+                    except Unresolvable:
+                        bad.append(ref)
         for sub in resource.subresources():
             walk(sub, res.in_subresource(sub))
 
