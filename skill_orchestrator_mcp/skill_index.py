@@ -54,8 +54,9 @@ def _is_skill_filename(path: Path) -> bool:
 def _extract_skill_metadata(skill: Mapping[str, Any]) -> Dict[str, Any]:
     """Strip code and keep metadata fields only."""
 
-    # Keep backwards/forwards compatible: only remove `code`, keep everything else.
-    return {k: v for k, v in skill.items() if k != "code"}
+    # Keep backwards/forwards compatible: drop only the bulky fields (code and
+    # test cases), keep everything else.
+    return {k: v for k, v in skill.items() if k not in ("code", "tests")}
 
 
 class SkillIndex:

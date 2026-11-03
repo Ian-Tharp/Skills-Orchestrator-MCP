@@ -10,10 +10,12 @@ A self-evolving MCP (Model Context Protocol) server that enables AI agents to dy
 - [Key Capabilities](#key-capabilities)
 - [Why This Matters: Token Efficiency & Context Management](#why-this-matters-token-efficiency--context-management)
 - [How AI Agents Can Leverage This System](#how-ai-agents-can-leverage-this-system)
-- [Available Tools](#available-tools-19-mcp-tools)
+- [Available Tools](#available-tools-22-mcp-tools)
 - [Skill Composition System](#skill-composition-system)
 - [State Bridge](#state-bridge)
 - [Safe Self-Editing: Versions, Contracts, Telemetry](#safe-self-editing-versions-contracts-telemetry)
+- [Verified Saves and Skill Lifecycle](#verified-saves-and-skill-lifecycle)
+- [Portability: SKILL.md Export and Import](#portability-skillmd-export-and-import)
 - [Debugging & Development](#debugging--development)
 - [Configuration](#configuration)
 - [Storage Architecture](#storage-architecture)
@@ -51,9 +53,11 @@ This isn't just a tool server - it's infrastructure for **AI self-improvement** 
 - **Compose** skills by calling other skills (skill chaining)
 - **Version** every edit, diff versions, and roll back a bad change
 - **Enforce** declared Python dependencies and a JSON Schema for parameters
+- **Verify** skills by running their test cases before they are saved
+- **Export / import** skills as agentskills.io `SKILL.md` folders
 
 ### Code Execution Engine
-- **Execute** Python code in isolated subprocess environments
+- **Execute** Python code in a separate subprocess with an allowlisted environment (no API keys); see [Security](#security-considerations) for what is and isn't isolated
 - **Inject** context variables into execution namespace
 - **Capture** stdout, stderr, and return values
 - **Timeout** protection with real process boundaries
@@ -177,18 +181,26 @@ __result__ = {
 
 ---
 
-## Available Tools (19 MCP Tools)
+## Available Tools (22 MCP Tools)
 
 ### Skill Management
 
 | Tool | Description |
 |------|-------------|
-| `create_skill` | Create a new reusable skill with code, metadata, and examples |
+| `create_skill` | Create a new reusable skill with code, metadata, examples and test cases (tests run before saving) |
 | `invoke_skill` | Execute a stored skill with parameters and context |
-| `get_skill` | Get full skill details including code (optionally a past `version`) |
-| `update_skill` | Update code, description, tags, dependencies, schema, category or examples; saves a new version |
+| `get_skill` | Get full skill details including code, status and health (optionally a past `version`) |
+| `update_skill` | Update code, description, tags, dependencies, schema, category, examples or tests; saves a new version (tests run first) |
+| `verify_skill` | Re-run a skill's test cases and update its status (verified / draft / unverified) |
 | `delete_skill` | Delete a skill permanently (refused if other skills call it, unless `force=True`) |
-| `search_skills` | Search and filter skills with pagination |
+| `search_skills` | Search and filter skills with pagination; shows status and `degraded` |
+
+### Portability
+
+| Tool | Description |
+|------|-------------|
+| `export_skill` | Write a skill as an agentskills.io folder (`SKILL.md` + `scripts/`) |
+| `import_skill` | Create a skill from such a folder (goes through the verified-save gate) |
 
 ### Versioning
 
@@ -421,6 +433,100 @@ is killed before it can report them); the top-level timeout is.
 
 ---
 
+## Verified Saves and Skill Lifecycle
+
+Self-written skills only help when they actually work: SkillsBench (2026)
+found that agent-generated skills gave no benefit on average and hurt some
+tasks unless they were checked by running them. So `create_skill` and
+`update_skill` run the skill's test cases in the sandbox **before** saving.
+
+```python
+create_skill(
+    name="csv_row_count",
+    description="Count data rows in a CSV string",
+    code="__result__ = len(params['text'].strip().splitlines()) - 1",
+    tests=[
+        {"parameters": {"text": "a,b\n1,2\n3,4"}, "expected_result": 2},
+        {"name": "header only", "parameters": {"text": "a,b"}, "expected_result": 0},
+    ],
+    examples=["How many rows are in this CSV?", '{"text": "a,b"}'],
+)
+```
+
+- **Test cases** are `tests` (parameters, context, optional
+  `expected_result` compared as JSON, optional `timeout`) plus any example
+  that is a JSON object, which is run as parameters. Up to 10 cases.
+- Parameters are checked against `parameters_schema` (defaults filled in)
+  before each case runs.
+- A case passes if the run finishes without error (and, when given, the
+  result matches). **If any case fails the skill is not saved** and the
+  failures are returned. Pass `save_as_draft=True` to keep it anyway with
+  status `draft`.
+- Test runs **never commit state** (writes are dropped) and are not recorded
+  in telemetry. They do run the code, so a skill with side effects (files,
+  network) has them during verification too.
+- `update_skill` re-runs the tests only when code, schema, dependencies,
+  tests or examples change. A failing update leaves the current version in
+  place.
+- `verify_skill(name)` re-runs the tests without creating a version, e.g.
+  after installing a missing dependency or fixing a skill a draft calls.
+- `rollback_skill` restores the status the target version had.
+
+**Statuses:** `verified` (all cases passed), `unverified` (nothing to run:
+no cases, or unmet dependencies), `draft` (a case failed and it was saved
+anyway). Skills created before this feature show as `unverified`. Set
+`SKILL_ORCHESTRATOR_REQUIRE_VERIFIED_SKILLS=on` to refuse unverified saves
+(they can still be saved as drafts).
+
+**Degraded:** `search_skills`, `get_skill` and `get_orchestrator_status`
+flag a skill as degraded when more than 50% of its current version's last
+20 runs failed (minimum 5 runs). A new version starts clean. Nothing is
+deleted or rolled back automatically; the flag tells the agent to look at
+`get_skill_stats` and consider `rollback_skill`. Invoking a `draft` adds a
+warning to the output.
+
+---
+
+## Portability: SKILL.md Export and Import
+
+`SKILL.md` ([agentskills.io](https://agentskills.io), Dec 2025) is the
+cross-vendor skill format. Skills can be moved in and out of it:
+
+```python
+export_skill("csv_row_count", directory="/home/me/skills")
+import_skill(path="/home/me/skills/csv-row-count")   # on another machine/server
+```
+
+The folder looks like this:
+
+```
+csv-row-count/
+├── SKILL.md                            # frontmatter: name, description, compatibility, metadata
+├── scripts/
+│   ├── csv_row_count.py                # the skill code
+│   └── run.py                          # python scripts/run.py '{"text": "a,b"}' -> prints 0
+├── examples/examples.json              # {"examples": [...], "tests": [...]}
+└── references/parameters.schema.json   # only if the skill has a schema
+```
+
+- Spec names are lowercase with hyphens, so `csv_row_count` becomes
+  `csv-row-count`. The original name, category, tags, dependencies, version
+  and entrypoint are kept in `metadata` (string values, lists as JSON) so
+  the round trip is exact.
+- `import_skill` also accepts SKILL.md folders from other tools: the code is
+  `metadata.entrypoint`, or the only `.py` file in `scripts/`.
+  Instruction-only skills (no script) are refused. Use `name=` to import
+  under a different name.
+- Imports go through `create_skill`, so test cases run before saving.
+- Paths must be absolute. Reads never leave the skill folder (symlinks
+  included). `export_skill` won't write into a non-empty folder unless
+  `overwrite=True`, and never deletes files. Set
+  `SKILL_ORCHESTRATOR_PORTABLE_ROOT` to confine both tools to one folder.
+- `scripts/run.py` runs the code without the orchestrator; composition and
+  state helpers (`invoke_skill`, `get_state`, ...) aren't available there.
+
+---
+
 ## Debugging & Development
 
 ### Built-in Debug Helpers
@@ -481,6 +587,12 @@ When skills fail, error messages include:
 | `SKILL_ORCHESTRATOR_TELEMETRY` | on | Set to `off` to stop recording executions |
 | `SKILL_ORCHESTRATOR_TELEMETRY_MAX_RECORDS` | 10000 | Telemetry log size cap (oldest records dropped) |
 | `SKILL_ORCHESTRATOR_MAX_SKILL_VERSIONS` | 50 | Snapshots kept per skill |
+| `SKILL_ORCHESTRATOR_ENV_PASSTHROUGH` | (empty) | Comma-separated extra env var names copied into the skill process (see [Security](#security-considerations)) |
+| `SKILL_ORCHESTRATOR_REQUIRE_VERIFIED_SKILLS` | off | `on` refuses to save skills that have no runnable test cases (unless saved as drafts) |
+| `SKILL_ORCHESTRATOR_DEGRADED_FAILURE_RATE` | 0.5 | Share of recent runs that must fail for a skill to show as degraded |
+| `SKILL_ORCHESTRATOR_DEGRADED_WINDOW` | 20 | Number of recent runs (of the current version) considered |
+| `SKILL_ORCHESTRATOR_DEGRADED_MIN_RUNS` | 5 | Minimum recent runs before a skill can be degraded |
+| `SKILL_ORCHESTRATOR_PORTABLE_ROOT` | (unset) | If set, `export_skill` / `import_skill` only accept paths inside this folder |
 
 ### Timeout Configuration
 
@@ -735,18 +847,55 @@ await list_state({
 
 ## Security Considerations
 
-- Code runs in isolated subprocess with separate Python interpreter
-- Execution timeout enforced via process boundary (can't be bypassed)
-- Standard library access (use carefully for network/file operations)
-- Output truncation prevents memory issues
-- Skills can read and write persistent state through the state bridge; namespaces are validated the same way as the MCP tools, so a skill cannot write outside the state directory through it (it can still use the filesystem directly, see above)
-- Graceful termination with configurable grace period
+The skill runner is a **process boundary, not a sandbox**. Skills and
+`execute_code` run code the agent wrote, as the same OS user as the server.
+Treat the server as having the permissions of that user.
+
+### What is isolated
+
+| Protection | Details |
+|---|---|
+| **Separate process** | Each run is a fresh `python` subprocess in a throwaway temp directory, with `stdin` closed. A crash or `sys.exit()` can't take down the server. |
+| **Real timeouts** | The process is killed when the timeout passes (default 30 s, max 180 s). |
+| **Scrubbed environment** | The child does **not** inherit the server's environment. It gets only what Python needs to start: `PATH`, locale (`LANG`, `LC_*`, `TZ`), `HOME`/`TMPDIR` on POSIX, and `SYSTEMROOT`, `SYSTEMDRIVE`, `WINDIR`, `COMSPEC`, `PATHEXT`, `TEMP`/`TMP`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`/`LOCALAPPDATA`, `PROGRAMDATA`, `PROCESSOR_ARCHITECTURE`, `NUMBER_OF_PROCESSORS` on Windows, plus `PYTHONIOENCODING=utf-8` and `PYTHONDONTWRITEBYTECODE=1`. API keys, tokens, proxy settings and `SKILL_ORCHESTRATOR_*` settings are not passed. Processes the skill starts inherit the same scrubbed environment. |
+| **Operator-only passthrough** | `SKILL_ORCHESTRATOR_ENV_PASSTHROUGH=NAME1,NAME2` copies those named variables from the server's environment. It is read from the server's own environment, so an MCP client cannot set it; tool arguments (`context`, `parameters`) become Python variables, never environment variables. Only pass what skills must have, and remember any skill can then read it. `get_orchestrator_status` lists the names (never values). |
+| **State writes** | Skills reach persistent state only through the state bridge (validated namespaces, committed only on success). |
+| **Verified saves** | New and changed skills run their test cases before they are saved (see above). |
+
+### What is NOT isolated
+
+- **Filesystem:** a skill can read and write anything the server's user can,
+  including `~/.skill_orchestrator` itself (skills, state, telemetry) and
+  credential files such as `~/.aws/credentials` or `~/.netrc`. The scrubbed
+  environment only removes secrets that live in environment variables.
+- **Network:** unrestricted outbound access.
+- **Resources:** no memory, CPU or process-count limits beyond the timeout.
+- **Other processes:** no namespaces, seccomp, or containers. A skill can
+  start background processes that outlive the timeout.
+- **In-process mode:** `SKILL_ORCHESTRATOR_EXEC_MODE=inprocess` runs code
+  inside the server with full access to its memory and environment (no
+  scrub, no timeout). Do not use it with untrusted code.
+- **Verification side effects:** test cases run the real code, so a skill
+  that writes files or calls an API does so while being verified.
+
+For untrusted code, run the whole server inside a container or VM with no
+credentials mounted and a network egress allowlist.
+
+### No package installation
+
+The orchestrator never installs packages. Declared `dependencies` are only
+checked against the interpreter that runs skills; unmet ones are refused at
+invoke time with an install hint for the operator. There is deliberately no
+`uv run --with` / `pip install` path: installing arbitrary packages chosen by
+an agent runs their install hooks and fetches code from the network, which
+is unsafe without a network allowlist and a package allowlist. If such a path
+is ever added it must stay off by default.
 
 ```bash
 # Use subprocess mode (default, recommended)
 # SKILL_ORCHESTRATOR_EXEC_MODE=subprocess
 
-# Legacy in-process mode (not recommended - no timeout guarantee)
+# Legacy in-process mode (not recommended - no timeout, no env scrub)
 # SKILL_ORCHESTRATOR_EXEC_MODE=inprocess
 ```
 
@@ -754,7 +903,7 @@ await list_state({
 
 ## Future Roadmap
 
-- [ ] Docker-based sandboxed execution for enhanced security
+- [ ] Docker-based sandboxed execution for enhanced security (filesystem/network isolation)
 - [x] Skill composition and chaining (Implemented!)
 - [ ] Built-in skill templates for common patterns
 - [ ] Remote skill sharing and discovery
@@ -765,7 +914,10 @@ await list_state({
 - [x] Skill versioning with rollback support (Implemented!)
 - [x] Dependency and parameter-schema enforcement (Implemented!)
 - [x] State bridge: persistent state from inside skills (Implemented!)
-- [ ] Skill testing framework
+- [x] Verified-save gate: test cases run before a skill is saved (Implemented!)
+- [x] Scrubbed environment for skill processes (Implemented!)
+- [x] SKILL.md (agentskills.io) export and import (Implemented!)
+- [ ] Filesystem and network isolation for skill processes
 
 ---
 

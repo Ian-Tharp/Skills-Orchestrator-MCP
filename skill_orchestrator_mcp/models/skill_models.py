@@ -9,6 +9,37 @@ from pydantic import BaseModel, ConfigDict, Field
 from .common import ResponseFormat, SkillCategory
 
 
+class SkillTestCase(BaseModel):
+    """One sandboxed check run before a skill is saved (the verified-save gate)."""
+    model_config = ConfigDict(extra='forbid')
+
+    name: Optional[str] = Field(
+        default=None,
+        description="Optional label shown in verification results",
+        max_length=100,
+    )
+    parameters: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Parameters passed to the skill (validated against parameters_schema)",
+    )
+    context: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Context variables passed to the skill",
+    )
+    expected_result: Any = Field(
+        default=None,
+        description=(
+            "If set, the skill's __result__ must equal this (compared as JSON). "
+            "If omitted, the case passes when the run finishes without error."
+        ),
+    )
+    timeout: Optional[int] = Field(
+        default=None,
+        description="Seconds allowed for this case (default: the server's default timeout)",
+        ge=1,
+    )
+
+
 class CreateSkillInput(BaseModel):
     """Input model for creating a new skill."""
     model_config = ConfigDict(
@@ -56,8 +87,27 @@ class CreateSkillInput(BaseModel):
     )
     examples: List[str] = Field(
         default_factory=list,
-        description="Example usage strings to help discover when this skill is useful",
+        description=(
+            "Example usage strings to help discover when this skill is useful. An example "
+            "that is a JSON object (e.g. '{\"x\": 2}') is also run as test parameters."
+        ),
         max_length=5
+    )
+    tests: List[SkillTestCase] = Field(
+        default_factory=list,
+        description=(
+            "Test cases run in the sandbox before the skill is saved. If any fails, "
+            "the skill is not saved (unless save_as_draft=True). State writes made "
+            "during tests are never committed."
+        ),
+        max_length=10
+    )
+    save_as_draft: bool = Field(
+        default=False,
+        description=(
+            "Save even if a test fails; the skill is marked status 'draft' and the "
+            "failures are reported. Fix it with update_skill or re-check with verify_skill."
+        ),
     )
 
 

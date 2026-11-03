@@ -7,7 +7,7 @@ Organized by domain for clarity and maintainability.
 from .artifact_models import GetArtifactInput, StoreArtifactInput
 from .common import ResponseFormat, ReturnMode, SkillCategory
 from .execution_models import ExecuteCodeInput, InvokeSkillInput
-from .skill_models import CreateSkillInput, SearchSkillsInput
+from .skill_models import CreateSkillInput, SearchSkillsInput, SkillTestCase
 from .state_models import ListStateInput, StateInput
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     # Skill models
     "CreateSkillInput",
     "SearchSkillsInput",
+    "SkillTestCase",
     # State models
     "ListStateInput",
     "StateInput",

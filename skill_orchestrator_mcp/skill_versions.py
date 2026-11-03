@@ -35,6 +35,7 @@ CONTENT_FIELDS = (
     "dependencies",
     "parameters_schema",
     "examples",
+    "tests",
 )
 
 _VERSION_FILE_RE = re.compile(r"^v(\d+)\.json$")
