@@ -44,9 +44,14 @@ jobs:
         os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
         include:
-          # The server has Windows-specific subprocess handling; keep it covered.
+          # The server has Windows-specific subprocess handling and a
+          # per-platform sandbox env allowlist; cover oldest and newest Python.
+          - os: windows-latest
+            python-version: "3.10"
           - os: windows-latest
             python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v4
 

@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from . import sandbox_env
 from . import skill_contracts as contracts
 from .artifacts import ArtifactStore
 from .models import (
@@ -1578,6 +1579,9 @@ async def _run_code(
                 stdout=stdout_opt,
                 stderr=stderr_opt,
                 cwd=str(tmp_dir),
+                # Never inherit the server's environment: it may hold the
+                # client's API keys. Only allowlisted names reach the child.
+                env=sandbox_env.build_child_env(),
                 close_fds=True,
                 creationflags=creationflags,
             )
