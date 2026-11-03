@@ -22,10 +22,11 @@ import math
 import os
 import tempfile
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
 
 DEFAULT_TELEMETRY_FILENAME = "executions.jsonl"
 DEFAULT_MAX_RECORDS = 10_000
@@ -262,6 +263,26 @@ class ExecutionTelemetry:
                 for v, b in sorted(by_version.items(), key=lambda kv: _version_sort_key(kv[0]))
             },
         }
+
+    def recent_failures(
+        self, versions: Mapping[str, Any], *, window: int
+    ) -> Dict[str, Tuple[int, int]]:
+        """(failed, executed) over each skill's last ``window`` runs of a given version.
+
+        ``versions`` maps skill name to the version to look at (normally the
+        current one, so failures of an old version don't follow a fix).
+        Rejected runs never executed and are skipped. One pass over the log.
+        """
+        window = max(1, int(window))
+        tails: Dict[str, Deque[bool]] = {}
+        for r in self.records():
+            name = r.get("skill")
+            if not isinstance(name, str) or name not in versions:
+                continue
+            if r.get("version") != versions[name] or r.get("status") == STATUS_REJECTED:
+                continue
+            tails.setdefault(name, deque(maxlen=window)).append(r.get("status") != STATUS_OK)
+        return {name: (sum(t), len(t)) for name, t in tails.items()}
 
     def all_stats(self) -> Dict[str, Dict[str, Any]]:
         """Overall summary per skill (``execute_code`` runs under '(execute_code)')."""

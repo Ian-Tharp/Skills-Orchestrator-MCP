@@ -38,6 +38,7 @@ from mcp.types import ToolAnnotations
 
 from . import sandbox_env
 from . import skill_contracts as contracts
+from . import skill_verification as verification
 from .artifacts import ArtifactStore
 from .models import (
     CreateSkillInput,
@@ -49,6 +50,7 @@ from .models import (
     ReturnMode,
     SearchSkillsInput,
     SkillCategory,
+    SkillTestCase,
     StateInput,
     StoreArtifactInput,
 )
@@ -173,6 +175,19 @@ SKILL_VERSIONS = SkillVersionStore(
     DEFAULT_SKILLS_DIR,
     max_versions=max(1, _get_int_env("SKILL_ORCHESTRATOR_MAX_SKILL_VERSIONS", 50)),
 )
+
+# Verified-save gate and lifecycle
+# Reject saves that have no runnable test cases (unless saved as a draft).
+REQUIRE_VERIFIED_SKILLS = os.environ.get(
+    "SKILL_ORCHESTRATOR_REQUIRE_VERIFIED_SKILLS", "off"
+).strip().lower() in ("1", "on", "true", "yes")
+# A skill is shown as degraded when more than this share of the current
+# version's last DEGRADED_WINDOW runs failed (and at least DEGRADED_MIN_RUNS ran).
+DEGRADED_FAILURE_RATE = min(
+    1.0, max(0.0, _get_float_env("SKILL_ORCHESTRATOR_DEGRADED_FAILURE_RATE", 0.5))
+)
+DEGRADED_WINDOW = max(1, _get_int_env("SKILL_ORCHESTRATOR_DEGRADED_WINDOW", 20))
+DEGRADED_MIN_RUNS = max(1, _get_int_env("SKILL_ORCHESTRATOR_DEGRADED_MIN_RUNS", 5))
 
 # Serializes read-modify-write of state files (MCP tools + state bridge commits).
 _STATE_LOCK = threading.Lock()
@@ -363,6 +378,23 @@ def _sanitize_code_output(output: str) -> str:
     return output
 
 
+def _registry_entry(skill: Dict[str, Any]) -> Dict[str, Any]:
+    """What the child needs to know about one skill to invoke it."""
+    schema = skill.get('parameters_schema')
+    return {
+        'name': skill['name'],
+        'code': skill['code'],
+        'description': skill.get('description', ''),
+        'version': skill.get('version', 1),
+        'dependencies': skill.get('dependencies') or [],
+        # Checked here (same interpreter as the child) so the child can refuse cheaply.
+        'missing_dependencies': contracts.missing_dependencies(skill.get('dependencies')),
+        'parameters_schema': schema,
+        # Legacy skills may carry a broken schema; the child skips enforcing those.
+        'schema_valid': contracts.check_schema(schema) is None,
+    }
+
+
 def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
     """Build a registry of all skills for subprocess injection.
 
@@ -374,19 +406,7 @@ def _build_skill_registry() -> Dict[str, Dict[str, Any]]:
         skill = _load_skill(name)
         # Skip malformed skill files so one bad file can't break composition.
         if skill and isinstance(skill.get('code'), str):
-            schema = skill.get('parameters_schema')
-            registry[name] = {
-                'name': skill['name'],
-                'code': skill['code'],
-                'description': skill.get('description', ''),
-                'version': skill.get('version', 1),
-                'dependencies': skill.get('dependencies') or [],
-                # Checked here (same interpreter as the child) so the child can refuse cheaply.
-                'missing_dependencies': contracts.missing_dependencies(skill.get('dependencies')),
-                'parameters_schema': schema,
-                # Legacy skills may carry a broken schema; the child skips enforcing those.
-                'schema_valid': contracts.check_schema(schema) is None,
-            }
+            registry[name] = _registry_entry(skill)
     return registry
 
 
@@ -427,6 +447,194 @@ def _format_warnings(warnings: List[str]) -> str:
     return "\n\n**Warnings:**\n" + "\n".join(f"- {w}" for w in warnings)
 
 
+def _case_timeout(raw: Any) -> int:
+    try:
+        value = int(raw) if raw is not None else MAX_EXECUTION_TIME
+    except (TypeError, ValueError):
+        value = MAX_EXECUTION_TIME
+    return max(1, min(value, MAX_EXECUTION_TIME_LIMIT))
+
+
+async def _verify_skill(skill: Dict[str, Any]) -> verification.VerificationReport:
+    """Run a (possibly unsaved) skill's test cases in the sandbox.
+
+    The candidate replaces any saved skill of the same name in the composition
+    registry, so it can call itself and other skills as it will after saving.
+    State writes are never committed and runs are not recorded in telemetry.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    cases = verification.collect_cases(skill)
+    if not cases:
+        return verification.VerificationReport(
+            status=verification.STATUS_UNVERIFIED,
+            reason=(
+                "no runnable test cases: add `tests`, or an example that is a JSON object "
+                "of parameters"
+            ),
+            checked_at=now,
+        )
+    missing = contracts.missing_dependencies(skill.get('dependencies'))
+    if missing:
+        return verification.VerificationReport(
+            status=verification.STATUS_UNVERIFIED,
+            reason=f"tests not run, unmet dependencies: {', '.join(missing)}",
+            checked_at=now,
+        )
+
+    name = str(skill['name'])
+    schema = skill.get('parameters_schema')
+    schema_ok = bool(schema) and contracts.check_schema(schema) is None
+    overrides = {name: _registry_entry(skill)}
+    results: List[verification.CaseResult] = []
+    for case in cases:
+        label = str(case.get('name') or f"test {len(results) + 1}")
+        parameters = case.get('parameters') or {}
+        context = case.get('context') or {}
+        if not isinstance(parameters, dict) or not isinstance(context, dict):
+            results.append(
+                verification.CaseResult(label, False, "parameters and context must be objects")
+            )
+            continue
+        if schema_ok:
+            assert isinstance(schema, dict)
+            parameters = contracts.apply_defaults(schema, parameters)
+            errors = contracts.validate_params(schema, parameters)
+            if errors:
+                results.append(
+                    verification.CaseResult(label, False, "invalid parameters: " + "; ".join(errors))
+                )
+                continue
+        outcome = await _run_code(
+            code=str(skill['code']),
+            context={
+                'params': parameters,
+                'context': context,
+                '__skill_name__': name,
+                '__skill_id__': skill.get('id'),
+                '__skill_version__': skill.get('version', 1),
+            },
+            timeout=_case_timeout(case.get('timeout')),
+            capture_output=True,
+            enable_composition=True,
+            current_skill_name=name,
+            registry_overrides=overrides,
+            commit_state=False,
+        )
+        if outcome.status != STATUS_OK:
+            results.append(
+                verification.CaseResult(
+                    label, False, outcome.error or outcome.status, outcome.duration_ms
+                )
+            )
+        elif 'expected_result' in case and not verification.results_match(
+            case['expected_result'], outcome.result
+        ):
+            expected = json.dumps(case['expected_result'], default=str)[:300]
+            got = json.dumps(outcome.result, default=str)[:300]
+            results.append(
+                verification.CaseResult(
+                    label, False, f"expected result {expected}, got {got}", outcome.duration_ms
+                )
+            )
+        else:
+            results.append(verification.CaseResult(label, True, None, outcome.duration_ms))
+
+    failed = any(not r.passed for r in results)
+    return verification.VerificationReport(
+        status=verification.STATUS_DRAFT if failed else verification.STATUS_VERIFIED,
+        cases=results,
+        checked_at=now,
+    )
+
+
+def _apply_gate(
+    skill_data: Dict[str, Any],
+    report: verification.VerificationReport,
+    save_as_draft: bool,
+) -> Optional[str]:
+    """Decide whether a verified candidate may be saved.
+
+    Returns an error message (nothing is saved), or None after setting the
+    skill's `status` and `verification` fields.
+    """
+    name = skill_data['name']
+    if report.failed:
+        if not save_as_draft:
+            failed = len(report.cases) - report.passed_count
+            return (
+                f"Error: Skill '{name}' was not saved: {failed} of {len(report.cases)} test "
+                f"case(s) failed in the sandbox.\n\n{report.failure_block()}\n\n"
+                "Fix the code or the tests, or pass save_as_draft=True to keep it as a draft."
+            )
+        report.status = verification.STATUS_DRAFT
+    elif report.status == verification.STATUS_UNVERIFIED and REQUIRE_VERIFIED_SKILLS:
+        if not save_as_draft:
+            return (
+                f"Error: Skill '{name}' was not saved: this server only accepts verified skills "
+                f"(SKILL_ORCHESTRATOR_REQUIRE_VERIFIED_SKILLS) and it could not be verified "
+                f"({report.reason}). Add test cases, or pass save_as_draft=True."
+            )
+        report.status = verification.STATUS_DRAFT
+    skill_data['status'] = report.status
+    skill_data['verification'] = report.to_record()
+    return None
+
+
+def _verification_text(report: verification.VerificationReport) -> str:
+    text = f"**Verification:** {report.summary_line()}"
+    if report.failed:
+        text += "\n" + report.failure_block()
+    if report.status == verification.STATUS_DRAFT:
+        text += (
+            "\nSaved as a **draft**. Fix it with update_skill, or re-check with verify_skill."
+        )
+    elif report.status == verification.STATUS_UNVERIFIED:
+        text += (
+            "\nTip: add `tests` (parameters + expected_result) so changes are checked "
+            "before they are saved."
+        )
+    return text
+
+
+def _coerce_tests(tests: List[Any]) -> List[Dict[str, Any]]:
+    """Store test cases as plain dicts, keeping `expected_result` only if it was given."""
+    out = []
+    for t in tests:
+        model = t if isinstance(t, SkillTestCase) else SkillTestCase.model_validate(t)
+        out.append(model.model_dump(exclude_unset=True))
+    return out
+
+
+def _health_map(skills: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Recent failure counts for each skill's current version, with a degraded flag."""
+    if not TELEMETRY.enabled or not skills:
+        return {}
+    versions = {
+        str(s['name']): int(s.get('version', 1) or 1) for s in skills if s.get('name')
+    }
+    counts = TELEMETRY.recent_failures(versions, window=DEGRADED_WINDOW)
+    return {
+        name: {
+            'recent_runs': executed,
+            'recent_failures': failed,
+            'degraded': verification.is_degraded(
+                failed, executed, threshold=DEGRADED_FAILURE_RATE, min_runs=DEGRADED_MIN_RUNS
+            ),
+        }
+        for name, (failed, executed) in counts.items()
+    }
+
+
+def _health_text(health: Optional[Dict[str, Any]], version: Any) -> Optional[str]:
+    if not health or not health.get('degraded'):
+        return None
+    return (
+        f"⚠️ degraded: {health['recent_failures']} of the last {health['recent_runs']} runs "
+        f"of v{version} failed (see get_skill_stats; rollback_skill can restore a "
+        "working version)"
+    )
+
+
 # =============================================================================
 # Core Tools
 # =============================================================================
@@ -447,11 +655,18 @@ async def create_skill(params: CreateSkillInput) -> str:
     Skills are stored code patterns that can be invoked later. They enable
     progressive capability building - create a skill once, use it many times.
 
+    Verified-save gate: the skill's test cases (`tests`, plus any example
+    that is a JSON object of parameters) are run in the sandbox first. If one
+    fails, the skill is not saved, unless `save_as_draft=True`, in which case
+    it is saved with status 'draft'. With no runnable cases it is saved as
+    'unverified'. State writes made by test runs are never committed.
+
     Best practices:
     - Include a main() function for entry point
     - Document parameters in the description
     - Add relevant tags for discoverability
     - Keep skills focused on a single purpose
+    - Add `tests` with an expected_result so later edits are checked too
 
     Args:
         params: CreateSkillInput containing:
@@ -463,6 +678,8 @@ async def create_skill(params: CreateSkillInput) -> str:
             - dependencies: Required packages
             - parameters_schema: JSON Schema for parameters
             - examples: Usage examples
+            - tests: Test cases run before saving
+            - save_as_draft: Save as a draft even if a test fails
 
     Returns:
         str: Confirmation message with skill ID
@@ -483,6 +700,7 @@ async def create_skill(params: CreateSkillInput) -> str:
         "dependencies": params.dependencies,
         "parameters_schema": params.parameters_schema,
         "examples": params.examples,
+        "tests": _coerce_tests(params.tests),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "version": 1,
@@ -504,6 +722,14 @@ async def create_skill(params: CreateSkillInput) -> str:
         return "Error: " + "; ".join(dep_errors)
     warnings = _contract_warnings(params.name, params.code, params.dependencies)
 
+    # Verified-save gate: run the test cases in the sandbox before saving.
+    report = await _verify_skill(skill_data)
+    gate_error = _apply_gate(skill_data, report, params.save_as_draft)
+    if gate_error:
+        return gate_error
+    if _load_skill(params.name):
+        return f"Error: Skill '{params.name}' was created by someone else while it was being verified."
+
     # Save skill
     _save_skill(skill_data)
     SKILL_INDEX.upsert_from_skill(skill_data)
@@ -517,6 +743,8 @@ async def create_skill(params: CreateSkillInput) -> str:
 **Category:** {params.category.value}
 **Tags:** {', '.join(params.tags) if params.tags else 'None'}
 **Dependencies:** {', '.join(params.dependencies) if params.dependencies else 'None'}
+
+{_verification_text(report)}
 
 The skill is now available for invocation via `invoke_skill`.{_format_warnings(warnings)}"""
 
@@ -557,6 +785,11 @@ async def invoke_skill(params: InvokeSkillInput) -> str:
 
     version = int(skill.get('version', 1) or 1)
     warnings: List[str] = []
+    if verification.skill_status(skill) == verification.STATUS_DRAFT:
+        warnings.append(
+            "This skill is a draft: its test cases failed when it was saved "
+            "(see get_skill)."
+        )
 
     def _reject(reason: str) -> str:
         TELEMETRY.record(
@@ -779,6 +1012,8 @@ class ExecutionOutcome:
     trace: List[Dict[str, Any]] = field(default_factory=list)
     # Number of state-bridge writes committed (0 when the run failed).
     state_writes: int = 0
+    # The run's __result__ (JSON-decoded), used by the verified-save gate.
+    result: Any = None
 
 
 def _record_outcome(
@@ -970,6 +1205,7 @@ except Exception as e:
         status=STATUS_ERROR if error else STATUS_OK,
         duration_ms=(time.perf_counter() - started) * 1000,
         error=str(error) if error else None,
+        result=result,
     )
 
 
@@ -1508,13 +1744,19 @@ async def _run_code(
     timeout: int = MAX_EXECUTION_TIME,
     capture_output: bool = True,
     enable_composition: bool = False,
-    current_skill_name: Optional[str] = None
+    current_skill_name: Optional[str] = None,
+    registry_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    commit_state: bool = True,
 ) -> ExecutionOutcome:
     """Internal code execution implementation.
 
     Default behavior executes code in a subprocess boundary so timeouts are real.
     Set env var SKILL_ORCHESTRATOR_EXEC_MODE=inprocess to use the legacy in-process
     exec() path (not recommended for untrusted code).
+
+    `registry_overrides` replaces registry entries for this run (used to test
+    a skill that is not saved yet). With `commit_state=False`, state-bridge
+    writes are dropped even when the run succeeds (verification runs).
     """
 
     exec_mode = os.environ.get("SKILL_ORCHESTRATOR_EXEC_MODE", "subprocess").strip().lower()
@@ -1545,7 +1787,11 @@ async def _run_code(
                 "result_path": str(result_path),
                 "common_imports": _COMMON_IMPORTS,
                 "helpers": _HELPER_FUNCTIONS,
-                "skill_registry": _build_skill_registry() if enable_composition else {},
+                "skill_registry": (
+                    {**_build_skill_registry(), **(registry_overrides or {})}
+                    if enable_composition
+                    else {}
+                ),
                 "max_call_depth": MAX_SKILL_CALL_DEPTH,
                 "current_skill_name": current_skill_name,
                 "state_dir": str(DEFAULT_STATE_DIR),
@@ -1651,6 +1897,10 @@ async def _run_code(
                     state_note = (
                         f"**State:** {discarded} pending write(s) discarded because the run failed."
                     )
+            elif state_ops and not commit_state:
+                state_note = (
+                    f"**State:** {len(state_ops)} write(s) not committed (verification run)."
+                )
             elif state_ops:
                 try:
                     counts = _commit_state_ops(state_ops)
@@ -1711,6 +1961,7 @@ async def _run_code(
                 error=error_summary,
                 trace=trace,
                 state_writes=state_writes,
+                result=result_obj,
             )
     except Exception:
         return ExecutionOutcome(
@@ -1793,10 +2044,21 @@ async def search_skills(params: SearchSkillsInput) -> str:
 
     # Optionally hydrate code only for the returned page.
     # Attach usage counts (index may contain legacy invocation_count, but usage is authoritative).
+    health = _health_map(page)
     page_with_usage: List[Dict[str, Any]] = []
     for meta in page:
         name = str(meta.get("name", ""))
-        page_with_usage.append({**meta, "invocation_count": USAGE_TRACKER.get(name)})
+        h = health.get(name) or {}
+        page_with_usage.append(
+            {
+                **meta,
+                "invocation_count": USAGE_TRACKER.get(name),
+                "status": verification.skill_status(meta),
+                "degraded": bool(h.get("degraded")),
+                "recent_runs": h.get("recent_runs", 0),
+                "recent_failures": h.get("recent_failures", 0),
+            }
+        )
     page = page_with_usage
 
     if params.include_code:
@@ -1840,6 +2102,10 @@ async def search_skills(params: SearchSkillsInput) -> str:
     for skill in page:
         lines.append(f"### {skill['name']}")
         lines.append(f"*{skill.get('description') or 'No description'}*\n")
+        lines.append(f"- **Status:** {skill['status']}")
+        health_line = _health_text(health.get(str(skill['name'])), skill.get('version', 1))
+        if health_line:
+            lines.append(f"- **Health:** {health_line}")
         lines.append(f"- **Category:** {skill.get('category', 'custom')}")
         lines.append(f"- **Tags:** {', '.join(skill.get('tags', [])) or 'None'}")
         lines.append(f"- **Dependencies:** {', '.join(skill.get('dependencies', [])) or 'None'}")
@@ -1918,6 +2184,24 @@ async def get_skill(name: str, version: Optional[int] = None) -> str:
         f"- **Invocations:** {skill.get('invocation_count', 0)}",
     ]
 
+    status_line = f"- **Status:** {verification.skill_status(skill)}"
+    record = skill.get('verification')
+    if isinstance(record, dict) and record.get('cases'):
+        status_line += (
+            f" ({record.get('passed', 0)}/{record['cases']} test case(s) passed, "
+            f"checked {str(record.get('checked_at') or '')[:19]})"
+        )
+    elif isinstance(record, dict) and record.get('reason'):
+        status_line += f" ({record['reason']})"
+    lines.append(status_line)
+    if isinstance(record, dict):
+        for failure in record.get('failures') or []:
+            lines.append(f"  - failed: {failure.get('case')}: {failure.get('error')}")
+    if is_current:
+        health_line = _health_text(_health_map([current]).get(name), shown_version)
+        if health_line:
+            lines.append(f"- **Health:** {health_line}")
+
     if skill.get('change_note'):
         lines.append(f"- **Change note:** {skill['change_note']}")
 
@@ -1945,6 +2229,11 @@ async def get_skill(name: str, version: Optional[int] = None) -> str:
         for ex in skill['examples']:
             lines.append(f"- {ex}")
 
+    if skill.get('tests'):
+        lines.append(
+            f"\n## Tests\n```json\n{json.dumps(skill['tests'], indent=2, default=str)}\n```"
+        )
+
     lines.append(f"\n## Code\n```python\n{skill['code']}\n```")
 
     return "\n".join(lines)
@@ -1971,6 +2260,8 @@ async def update_skill(
     examples: Optional[List[str]] = None,
     expected_version: Optional[int] = None,
     change_note: Optional[str] = None,
+    tests: Optional[List[SkillTestCase]] = None,
+    save_as_draft: bool = False,
 ) -> str:
     """Update an existing skill's properties.
 
@@ -1979,6 +2270,10 @@ async def update_skill(
     be undone with `rollback_skill`. Compare versions with
     `diff_skill_versions` and check error rates per version with
     `get_skill_stats`.
+
+    Verified-save gate: if the code, schema, dependencies, tests or examples
+    change, the skill's test cases are run in the sandbox first. If one fails
+    the update is not saved, unless `save_as_draft=True`.
 
     Args:
         name: Name of the skill to update
@@ -1993,6 +2288,8 @@ async def update_skill(
             currently at this version (guards against overwriting a
             concurrent edit by another agent)
         change_note: Short note on why the skill changed, kept with the version
+        tests: New test cases (optional; replaces the stored ones, [] removes them)
+        save_as_draft: Save even if a test fails, marking the skill 'draft'
 
     Returns:
         str: Confirmation of update
@@ -2046,8 +2343,29 @@ async def update_skill(
     if examples is not None:
         updated['examples'] = examples
 
+    if tests is not None:
+        if len(tests) > verification.MAX_TEST_CASES:
+            return f"Error: At most {verification.MAX_TEST_CASES} test cases are allowed."
+        try:
+            updated['tests'] = _coerce_tests(list(tests))
+        except ValueError as e:
+            return f"Error: Invalid test case: {e}"
+
     if all(updated.get(f) == skill.get(f) for f in CONTENT_FIELDS):
         return f"No changes: skill '{name}' is unchanged at version {current_version}."
+
+    report: Optional[verification.VerificationReport] = None
+    if any(updated.get(f) != skill.get(f) for f in verification.BEHAVIOR_FIELDS):
+        report = await _verify_skill({**updated, 'version': current_version + 1})
+        gate_error = _apply_gate(updated, report, save_as_draft)
+        if gate_error:
+            return gate_error.replace("was not saved", "was not updated", 1)
+        latest = _load_skill(name)
+        if not latest or int(latest.get('version', 1) or 1) != current_version:
+            return (
+                f"Error: Skill '{name}' changed while the update was being verified. "
+                "Reload it with get_skill and reapply your change."
+            )
 
     # Keep the pre-edit content restorable even for skills created before
     # version history existed.
@@ -2069,11 +2387,62 @@ async def update_skill(
     warnings = _contract_warnings(
         name, str(updated.get('code', '')), list(updated.get('dependencies') or [])
     )
+    verified_text = f"\n\n{_verification_text(report)}" if report else ""
     return (
         f"✅ Skill '{name}' updated to version {updated['version']}. "
         f"Undo with rollback_skill(name='{name}', version={current_version})."
-        f"{_format_warnings(warnings)}"
+        f"{verified_text}{_format_warnings(warnings)}"
     )
+
+
+@mcp.tool(
+    name="verify_skill",
+    annotations=ToolAnnotations(
+        title="Re-run a Skill's Test Cases",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True
+    )
+)
+async def verify_skill(name: str) -> str:
+    """Run a saved skill's test cases in the sandbox and update its status.
+
+    Use after installing a missing dependency, or to promote a draft once
+    the cause of its failure is fixed outside the skill. Does not create a
+    new version. State writes made by the tests are not committed.
+
+    Args:
+        name: Skill name
+
+    Returns:
+        str: Per-case results and the new status (verified, draft or unverified)
+    """
+    skill = _load_skill(name)
+    if not skill:
+        return f"Error: Skill '{name}' not found."
+    version = int(skill.get('version', 1) or 1)
+    report = await _verify_skill(skill)
+    if report.failed:
+        report.status = verification.STATUS_DRAFT
+
+    latest = _load_skill(name)
+    if not latest or int(latest.get('version', 1) or 1) != version:
+        return f"Error: Skill '{name}' changed during verification; run verify_skill again."
+    latest['status'] = report.status
+    latest['verification'] = report.to_record()
+    _save_skill(latest)
+    SKILL_INDEX.upsert_from_skill(latest)
+    SKILL_VERSIONS.save(latest)
+
+    lines = [f"## Verification: {name} (v{version})", "", _verification_text(report)]
+    if report.cases:
+        lines += ["", "| Case | Result | ms |", "|---|---|---|"]
+        for c in report.cases:
+            lines.append(
+                f"| {c.name} | {'pass' if c.passed else 'FAIL'} | {_fmt_ms(c.duration_ms)} |"
+            )
+    return "\n".join(lines)
 
 
 @mcp.tool(
@@ -2306,6 +2675,13 @@ async def rollback_skill(name: str, version: int, expected_version: Optional[int
 
     restored = dict(skill)
     for f in CONTENT_FIELDS:
+        if f in target:
+            restored[f] = copy.deepcopy(target[f])
+        else:
+            restored.pop(f, None)
+    # The restored content keeps the verification result it had (none for
+    # versions saved before the gate existed).
+    for f in ('status', 'verification'):
         if f in target:
             restored[f] = copy.deepcopy(target[f])
         else:
@@ -2792,6 +3168,32 @@ async def get_orchestrator_status() -> str:
         cat = str(skill.get("category", "custom"))
         skills_by_category[cat] = skills_by_category.get(cat, 0) + 1
 
+    drafts = sorted(
+        str(s.get("name")) for s in skills
+        if verification.skill_status(s) == verification.STATUS_DRAFT
+    )
+    verified_count = sum(
+        1 for s in skills if verification.skill_status(s) == verification.STATUS_VERIFIED
+    )
+    degraded = sorted(n for n, h in _health_map(skills).items() if h["degraded"])
+    env_info = sandbox_env.describe()
+    lifecycle_lines = (
+        f"- **Verified Skills:** {verified_count} of {skill_count}\n"
+        f"- **Draft Skills:** {', '.join(drafts) if drafts else 'None'}\n"
+        f"- **Degraded Skills:** {', '.join(degraded) if degraded else 'None'} "
+        f"(>{DEGRADED_FAILURE_RATE:.0%} of the last {DEGRADED_WINDOW} runs failed)"
+    )
+    sandbox_lines = (
+        f"- **Child environment:** allowlist only ({', '.join(env_info['default'])})\n"
+        f"- **Operator passthrough:** "
+        f"{', '.join(env_info['passthrough']) if env_info['passthrough'] else 'None'}"
+        + (
+            f" (ignored invalid names: {', '.join(env_info['rejected'])})"
+            if env_info['rejected']
+            else ""
+        )
+    )
+
     if TELEMETRY.enabled:
         overview = TELEMETRY.all_stats()
         recorded = sum(s["runs"] for s in overview.values())
@@ -2824,6 +3226,12 @@ async def get_orchestrator_status() -> str:
 
 ## Telemetry
 {telemetry_lines}
+
+## Skill Lifecycle
+{lifecycle_lines}
+
+## Sandbox
+{sandbox_lines}
 
 ## Skills by Category
 {chr(10).join(f'- **{cat}:** {count}' for cat, count in sorted(skills_by_category.items()))}
