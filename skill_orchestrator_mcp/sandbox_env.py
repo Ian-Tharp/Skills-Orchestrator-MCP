@@ -107,20 +107,24 @@ def build_child_env(
     parent_env: Optional[Mapping[str, str]] = None,
     *,
     is_windows: Optional[bool] = None,
+    allow_passthrough: bool = True,
 ) -> Dict[str, str]:
     """Return the complete environment for a sandboxed child process.
 
     Only allowlisted names (platform defaults plus the operator's
     ``SKILL_ORCHESTRATOR_ENV_PASSTHROUGH``) are copied from ``parent_env``
     (default: ``os.environ``). Everything else, including every secret, is
-    dropped.
+    dropped. ``allow_passthrough=False`` (restricted trust tier) ignores the
+    operator passthrough and copies only the platform defaults.
     """
     if parent_env is None:
         parent_env = os.environ
     if is_windows is None:
         is_windows = os.name == "nt"
 
-    passthrough, _ = parse_passthrough(parent_env.get(PASSTHROUGH_ENV_VAR))
+    passthrough, _ = (
+        parse_passthrough(parent_env.get(PASSTHROUGH_ENV_VAR)) if allow_passthrough else ([], [])
+    )
     child: Dict[str, str] = {}
     for name in (*default_allowlist(is_windows), *passthrough):
         value = _lookup(parent_env, name, case_insensitive=is_windows)

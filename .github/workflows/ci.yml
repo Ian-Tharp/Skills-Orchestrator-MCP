@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly, so an upstream release that breaks fresh installs is caught
+    # even when nobody pushes.
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
@@ -33,6 +37,11 @@ jobs:
 
       - name: Mypy (strict, config in pyproject.toml)
         run: uv run mypy
+
+      - name: Mypy, Windows and macOS code paths
+        run: |
+          uv run mypy --platform win32
+          uv run mypy --platform darwin
 
   test:
     name: Tests (${{ matrix.os }}, py${{ matrix.python-version }})
@@ -65,3 +74,26 @@ jobs:
 
       - name: Pytest
         run: uv run pytest -v
+
+  fresh-install:
+    # Every other job installs from uv.lock, so it cannot see a new upstream
+    # release that breaks what users get from `pip install` / `uvx --from .`.
+    # This job resolves the declared ranges from scratch, the way a user does.
+    name: Fresh install, no lockfile (${{ matrix.os }}, py3.12)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Import the server from a fresh resolution
+        run: >-
+          uv run --isolated --no-project --refresh --python 3.12 --with .
+          python -c "import importlib.metadata as m; print('mcp', m.version('mcp'));
+          import skill_orchestrator_mcp.server as s; print('ok', s.mcp.name)"
